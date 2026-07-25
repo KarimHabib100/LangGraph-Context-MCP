@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [
-    { name = "Yassin Hassan Habib", email = "yassin.hassan.habib@gmail.com" },
+    { name = "Karim Habib", email = "karim.hasan.habib@gmail.com" },
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

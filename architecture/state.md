@@ -3,7 +3,7 @@
 
 ## CURRENT STATUS
 Phase:         Phase 0 — Bootstrap
-Status:        IN PROGRESS
+Status:        DONE
 Last Updated:  2026-07-25
 Active Role:   Backend Architect Agent
 
@@ -11,7 +11,7 @@ Active Role:   Backend Architect Agent
 
 | Phase | Name | Status | Completed Date |
 |---|---|---|---|
-| 0 | Bootstrap | NOT STARTED | |
+| 0 | Bootstrap | DONE | 2026-07-25 |
 | 1 | Core Parser & Graph Model | NOT STARTED | |
 | 2 | Embeddings, Storage & Semantic Search | NOT STARTED | |
 | 3 | QA / Breaker — Mid-Build | NOT STARTED | |
@@ -49,10 +49,10 @@ task 0.6 could run.
 |---|---|---|---|---|
 
 ## NEXT ACTION
-Action:   Verify PyPI name availability, then scaffold the project per Phase 0
-Command:  Check `https://pypi.org/project/langgraph-context-mcp/`, then `git init`
+Action:   Begin Phase 1 — Core Parser & Graph Model (define dataclasses, then build the ast-based walker)
+Command:  Create `src/langgraph_context_mcp/parser/graph_model.py`
 Role:     Backend Architect Agent
-Phase:    Phase 0, Task 0.1
+Phase:    Phase 1, Task 1.1
 
 ## DECISIONS SUMMARY
 
@@ -70,6 +70,7 @@ Phase:    Phase 0, Task 0.1
 |---|---|---|---|
 | COR-001 | No tree-sitter or compiled parsing dependency — stdlib `ast` only | Pre-build | ACTIVE |
 | COR-002 | No external LLM/embedding API call by default — local `fastembed` only | Pre-build | ACTIVE |
+| COR-003 | Never run `git push`, any phase, any circumstance — local `git commit` only, developer pushes manually | Phase 0 | ACTIVE |
 
 ## RISK STATUS SUMMARY
 
@@ -101,3 +102,5 @@ Phase:    Phase 0, Task 0.1
 | 2026-07-25 | Phase 0 | Task 0.7: Created `.gitignore` (standard Python patterns + `.langgraph-context/`) | Backend Architect Agent |
 | 2026-07-25 | Phase 0 | Task 0.9: Created `LICENSE` (MIT) | Backend Architect Agent |
 | 2026-07-25 | Phase 0 | Task 0.10: Created `.github/workflows/ci.yml` — runs `ruff check .` and `pytest` on push to any branch, Python 3.11 | Backend Architect Agent |
+| 2026-07-25 | Phase 0 | Phase 0 exit criteria verified all PASS. Initial commit `f73dcbf` created (35 files). Phase 0 marked DONE | Backend Architect Agent |
+| 2026-07-25 | Post-Phase 0 | Developer request: repo-wide name audit found one stray reference (`pyproject.toml` author name "Yassin Hassan Habib") corrected to "Karim Habib". Added COR-003 (never `git push`) to decisions.md, claude.md Absolute Laws, and this file's Correction Log Status. Not yet committed | Backend Architect Agent |

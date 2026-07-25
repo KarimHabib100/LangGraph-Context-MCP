@@ -274,6 +274,36 @@ provider added to this project.
 
 ---
 
+## COR-003 — Never run `git push` under any circumstance
+
+Date: 2026-07-25
+Phase: Pre-build (applies to every phase)
+Triggered By: Preventive — developer proactively restricting remote git operations before any
+phase's tasks or exit criteria could be misread as implying one
+
+### What Happened
+No push has been attempted. However, later phases reference PyPI publish readiness and public
+launch (e.g. Phase 5's "Ready for PyPI publish... and public launch" note in tasks.md), and an
+AI assistant could plausibly interpret completing such a milestone as including a `git push` to
+a remote, since that is the common default pattern for "finishing" work in most other projects.
+
+### Developer Correction
+Never run `git push`, under any circumstance, in any phase, even if a task or exit criteria
+seems to imply it. Local `git commit` stays allowed and required per tasks.md. All pushes to
+GitHub happen manually, by the developer, only.
+
+### Rule Going Forward
+Never execute `git push` (or any command that publishes local commits to a remote) anywhere in
+this project, in any phase, regardless of what tasks.md, state.md, or any exit/launch criteria
+appears to require. If a task seems to need a push, STOP and hand it back to the developer
+instead of running it.
+
+### Applies To
+Every phase, every role, all git operations in this project — including Phase 5's launch
+readiness work.
+
+---
+
 ## [Next correction — copy the template below when needed]
 
 ## COR-00X — [Short description of what was wrong]

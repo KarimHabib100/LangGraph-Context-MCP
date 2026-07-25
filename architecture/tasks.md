@@ -8,7 +8,7 @@
 
 | Phase | Name | Role | Status |
 |---|---|---|---|
-| 0 | Bootstrap | Backend Architect Agent | NOT STARTED |
+| 0 | Bootstrap | Backend Architect Agent | DONE |
 | 1 | Core Parser & Graph Model | Backend Architect Agent | NOT STARTED |
 | 2 | Embeddings, Storage & Semantic Search | AI Systems Agent | NOT STARTED |
 | 3 | QA / Breaker — Mid-Build | QA / Breaker Agent | NOT STARTED |

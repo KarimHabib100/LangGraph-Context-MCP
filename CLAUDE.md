@@ -24,6 +24,9 @@ do when the condition fails" or "trace the path from ingest to output."
 - Do not skip phases defined in tasks.md.
 - If uncertain about anything → STOP and ASK. Do not assume.
 - One phase at a time. One role at a time. Finish → STOP → await approval.
+- Never run `git push`, under any circumstance, in any phase, even if a task or exit criteria
+  seems to imply it. Local `git commit` stays allowed and required per tasks.md. All pushes to
+  GitHub happen manually, by the developer, only. See COR-003 in decisions.md.
 
 ## APPROVED TECH STACK
 
