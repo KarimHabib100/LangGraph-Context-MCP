@@ -50,3 +50,7 @@ Thumbs.db
 
 # LangGraph Context MCP local index
 .langgraph-context/
+
+architecture/
+agents/
+CLAUDE.md
