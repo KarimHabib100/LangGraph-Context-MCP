@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "langgraph-context-mcp"
+version = "0.1.0"
+description = "MCP server that parses LangGraph Python codebases into a structural graph model and layers local semantic search on top."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Yassin Hassan Habib", email = "yassin.hassan.habib@gmail.com" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "mcp>=1.27,<2",
+    "fastembed>=0.4",
+    "sqlite-vec>=0.1",
+]
+
+[project.optional-dependencies]
+pgvector = [
+    "psycopg[binary]>=3.2",
+    "pgvector>=0.3",
+]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+langgraph-context-mcp = "langgraph_context_mcp.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/langgraph_context_mcp"]
