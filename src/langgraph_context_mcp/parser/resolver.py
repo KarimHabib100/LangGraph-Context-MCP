@@ -24,6 +24,7 @@ from .ast_walker import (
     _parse_file,
     collect_node_function_refs,
     extract_tools_from_funcdef,
+    function_line_start,
 )
 from .graph_model import (
     RESOLUTION_FULL,
@@ -93,7 +94,7 @@ def resolve_cross_file_references(graph_def: GraphDef, repo_root: Path) -> Graph
         upgrades[node.name] = replace(
             node,
             source_file=display_path,
-            line_start=funcdef.lineno,
+            line_start=function_line_start(funcdef),  # includes decorators (DEC-013)
             line_end=funcdef.end_lineno or funcdef.lineno,
             docstring=ast.get_docstring(funcdef),
             function_body_hash=_hash_segment(source, funcdef),

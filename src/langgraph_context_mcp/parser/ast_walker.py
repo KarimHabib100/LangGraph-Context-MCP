@@ -306,7 +306,7 @@ def _handle_add_node(
     # state is tracked separately in `tool_resolution` below and never affects `resolution`.
     if funcdef is not None and not dynamic_name and not in_loop:
         resolution = RESOLUTION_FULL
-        line_start = funcdef.lineno
+        line_start = function_line_start(funcdef)
         line_end = funcdef.end_lineno or funcdef.lineno
         docstring = ast.get_docstring(funcdef)
         body_hash = _hash_segment(source, funcdef)
@@ -510,6 +510,26 @@ def _func_ref(func_arg: ast.AST | None) -> FuncRef:
     if func_arg is None:
         return FuncRef("none", None)
     return FuncRef("other", None)
+
+
+def function_line_start(funcdef: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
+    """Return the first line of ``funcdef``, counting its decorators (DEC-013).
+
+    ``ast`` puts a ``FunctionDef``'s ``lineno`` on the ``def`` line and keeps decorators in
+    ``decorator_list``, whose entries sit above it — so ``funcdef.lineno`` alone under-reports
+    where a decorated node actually begins. A decorator expression's own ``lineno`` is already
+    the line carrying its ``@`` (verified against CPython for both ``@name`` and a multi-line
+    ``@call(...)`` form), so the earliest of those lines is the first line of the node.
+
+    Shared by the same-file walker and the cross-file resolver so a decorated node reports the
+    same span wherever its function is defined.
+    """
+    earliest = funcdef.lineno
+    for decorator in funcdef.decorator_list:
+        decorator_line = getattr(decorator, "lineno", None)
+        if decorator_line is not None:
+            earliest = min(earliest, decorator_line)
+    return earliest
 
 
 def _resolve_local_func(

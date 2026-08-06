@@ -691,3 +691,173 @@ g.add_node("tools", ToolNode([toolkit.search, "web_search"]))
     by_name = {b.tool_name: b.tool_source for b in graph.tool_bindings}
     # Attribute form resolves the base module; a string tool name has no import source.
     assert by_name == {"search": "mypkg.tools", "web_search": None}
+
+
+# --------------------------------------------------------------------------------------------
+# line_start includes decorators (DEC-013, task 1.11)
+# --------------------------------------------------------------------------------------------
+def test_decorated_node_line_start_includes_its_decorators(tmp_path: Path):
+    """A decorated node begins at its first `@`, not at its `def` (DEC-013).
+
+    `ast` reports a FunctionDef's lineno on the `def` line and keeps decorators above it, so
+    without this the node's reported span silently excludes every decorator — which is both a
+    wrong answer for any consumer of line_start and the reason DEC-005's "docstring + decorators
+    + body" chunk had to be reconstructed heuristically at chunk time.
+    """
+    src = '''from langgraph.graph import StateGraph
+
+
+def trace(func):
+    return func
+
+
+@trace
+@trace
+def decorated(state):
+    """Decorated node."""
+    return state
+
+
+def plain(state):
+    """Undecorated node."""
+    return state
+
+
+g = StateGraph(dict)
+g.add_node("decorated", decorated)
+g.add_node("plain", plain)
+'''
+    path = _write(tmp_path, "decorated.py", src)
+    lines = src.splitlines()
+    graph = find_graph_definitions(path)[0]
+    by_name = {n.name: n for n in graph.nodes}
+
+    decorated = by_name["decorated"]
+    assert decorated.resolution == RESOLUTION_FULL
+    # line_start lands on the FIRST of the two decorators, not the second and not the def.
+    assert lines[decorated.line_start - 1] == "@trace"
+    assert lines[decorated.line_start] == "@trace"
+    assert lines[decorated.line_start + 1] == "def decorated(state):"
+    # The full span therefore carries decorators, docstring, and body together (DEC-005).
+    span = "\n".join(lines[decorated.line_start - 1 : decorated.line_end])
+    assert span.count("@trace") == 2
+    assert '"""Decorated node."""' in span
+    assert "return state" in span
+
+    # An undecorated node is unaffected: it still starts at its def line.
+    plain = by_name["plain"]
+    assert lines[plain.line_start - 1] == "def plain(state):"
+
+
+def test_multiline_decorator_line_start_is_the_at_sign(tmp_path: Path):
+    """A decorator whose arguments wrap across lines still anchors on its own `@` line."""
+    src = '''from langgraph.graph import StateGraph
+
+
+def tagged(**kwargs):
+    def wrap(func):
+        return func
+    return wrap
+
+
+@tagged(
+    name="wrapped",
+    retries=3,
+)
+def wrapped(state):
+    """Wrapped node."""
+    return state
+
+
+g = StateGraph(dict)
+g.add_node("wrapped", wrapped)
+'''
+    path = _write(tmp_path, "multiline_decorator.py", src)
+    lines = src.splitlines()
+    node = find_graph_definitions(path)[0].nodes[0]
+
+    assert lines[node.line_start - 1] == "@tagged("
+    span = "\n".join(lines[node.line_start - 1 : node.line_end])
+    assert 'name="wrapped"' in span
+    assert "def wrapped(state):" in span
+
+
+def test_cross_file_decorated_node_line_start_includes_decorators(tmp_path: Path):
+    """The resolver must agree with the walker — same construct, same span, either file."""
+    _write(tmp_path, "agent/__init__.py", "")
+    nodes_src = '''def trace(func):
+    return func
+
+
+@trace
+def remote(state):
+    """Remote node."""
+    return state
+'''
+    _write(tmp_path, "agent/nodes.py", nodes_src)
+    _write(
+        tmp_path,
+        "agent/graph.py",
+        '''from langgraph.graph import StateGraph
+
+from .nodes import remote
+
+g = StateGraph(dict)
+g.add_node("remote", remote)
+''',
+    )
+
+    node = scan_repository(tmp_path)[0].nodes[0]
+
+    assert node.resolution == RESOLUTION_FULL
+    assert node.source_file == "agent/nodes.py"
+    assert nodes_src.splitlines()[node.line_start - 1] == "@trace"
+
+
+def test_decorators_do_not_change_the_function_body_hash(tmp_path: Path):
+    """Widening the span must not disturb `function_body_hash`.
+
+    The hash comes from the `def`-onward source segment, so an existing index stays valid — a
+    changed hash would make every decorated node look edited on the next reindex.
+    """
+    undecorated = _write(
+        tmp_path,
+        "undecorated.py",
+        '''from langgraph.graph import StateGraph
+
+
+def node(state):
+    """A node."""
+    return state
+
+
+g = StateGraph(dict)
+g.add_node("node", node)
+''',
+    )
+    decorated = _write(
+        tmp_path,
+        "decorated_hash.py",
+        '''from langgraph.graph import StateGraph
+
+
+def trace(func):
+    return func
+
+
+@trace
+def node(state):
+    """A node."""
+    return state
+
+
+g = StateGraph(dict)
+g.add_node("node", node)
+''',
+    )
+
+    plain_node = find_graph_definitions(undecorated)[0].nodes[0]
+    decorated_node = find_graph_definitions(decorated)[0].nodes[0]
+
+    assert decorated_node.function_body_hash == plain_node.function_body_hash
+    assert decorated_node.line_start < decorated_node.line_end
