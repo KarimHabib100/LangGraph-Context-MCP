@@ -8,6 +8,28 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    # The pgvector half of the shared VectorStore contract test (task 2.8) skips wherever
+    # DATABASE_URL is unset, which is the normal state on a developer machine. CI is where it
+    # actually runs, so both backends are held to the same contract before Phase 5.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: langgraph_context_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/langgraph_context_test
+
     steps:
       - uses: actions/checkout@v4
 
@@ -15,8 +37,16 @@ jobs:
         with:
           python-version: "3.11"
 
+      # The local embedding model is ~500MB and is downloaded once on first use. Caching it
+      # keeps CI from re-downloading it on every push.
+      - name: Cache the embedding model
+        uses: actions/cache@v4
+        with:
+          path: /tmp/fastembed_cache
+          key: fastembed-nomic-embed-text-v1.5
+
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,pgvector]"
 
       - name: Run ruff
         run: ruff check .
