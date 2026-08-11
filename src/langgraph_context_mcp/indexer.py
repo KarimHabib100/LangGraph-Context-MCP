@@ -124,17 +124,18 @@ def index_repository(
 def build_chunk_text(node: NodeDef, repo_root: Path, source_cache: dict | None = None) -> str:
     """Return the text embedded for ``node``: its decorators, signature, docstring, and body.
 
-    Read as the source lines ``[line_start, line_end]`` extended upward over contiguous
-    decorator lines (DEC-012). The span already contains the docstring — it is the function's
-    first statement — so nothing is concatenated twice. Falls back to the docstring, then to the
-    node name, if the file cannot be read; every node always yields non-empty text.
+    Read as the source lines ``[line_start, line_end]``, which is the whole of DEC-005's chunk:
+    since DEC-013 the parser's ``line_start`` is the node's first decorator, and the span already
+    contains the docstring (it is the function's first statement), so all three components are
+    present exactly once with nothing concatenated twice.
+
+    Falls back to the docstring, then to the node name, if the file cannot be read; every node
+    always yields non-empty text.
     """
     lines = _source_lines(node.source_file, repo_root, source_cache)
     if lines:
         start = max(node.line_start - 1, 0)
         end = min(node.line_end, len(lines))
-        while start > 0 and lines[start - 1].strip().startswith("@"):
-            start -= 1
         text = "\n".join(line.rstrip() for line in lines[start:end]).strip()
         if text:
             return text
