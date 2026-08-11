@@ -244,12 +244,39 @@ class _GraphBuilder:
             repo_id=self.repo_id,
             file_path=self.file_path,
             variable_name=self.variable_name,
-            entry_point=self.entry_point,
+            entry_point=self.entry_point or self._derive_entry_point(),
             nodes=tuple(self._nodes.values()),
             edges=tuple(self._edges.values()),
             conditional_routes=tuple(self._routes.values()),
             tool_bindings=tuple(self._tool_bindings.values()),  # DEC-007
         )
+
+    def _derive_entry_point(self) -> str | None:
+        """The entry point implied by a lone normal ``add_edge(START, x)`` (DEC-015).
+
+        LangGraph documents ``set_entry_point(x)`` as sugar for ``add_edge(START, x)``, and real
+        code overwhelmingly writes the latter — so both must normalize to the same answer rather
+        than leaving this field null for the idiom that is actually used (QA-3-02).
+
+        Derived only when the answer is unambiguous. Two or more START edges is a parallel
+        fan-out, and a single *conditional* START edge is ``set_conditional_entry_point``, whose
+        entry is a routing function rather than a node — neither has a single node name to report,
+        so both stay ``None`` instead of guessing. Runs at build time, over the finished edge set,
+        so the result never depends on the order calls appeared in the source.
+        """
+        start_id = make_node_id(self.graph_id, START_SENTINEL)
+        from_start = [edge for edge in self._edges.values() if edge.source_node_id == start_id]
+        if len(from_start) != 1:
+            return None
+
+        edge = from_start[0]
+        if edge.type != EDGE_NORMAL:
+            return None
+
+        target = edge.target_node_id.removeprefix(f"{self.graph_id}::node::")
+        if target in (START_SENTINEL, END_SENTINEL):
+            return None
+        return target
 
 
 # --------------------------------------------------------------------------------------------

@@ -861,3 +861,92 @@ g.add_node("node", node)
 
     assert decorated_node.function_body_hash == plain_node.function_body_hash
     assert decorated_node.line_start < decorated_node.line_end
+
+
+# --------------------------------------------------------------------------------------------
+# entry_point derivation (DEC-015 / QA-3-02)
+#
+# LangGraph documents set_entry_point(x) as sugar for add_edge(START, x), and real code
+# overwhelmingly writes the latter — QA-3-02 found entry_point null on all 7 graphs of a real
+# repo for exactly that reason. Both idioms must now normalize to the same answer, and the
+# ambiguous shapes must stay None rather than guess.
+# --------------------------------------------------------------------------------------------
+_ENTRY_PREAMBLE = """\
+from langgraph.graph import START, END, StateGraph
+
+def alpha(state):
+    \"\"\"First.\"\"\"
+    return state
+
+def beta(state):
+    \"\"\"Second.\"\"\"
+    return state
+
+def router(state):
+    \"\"\"Routes.\"\"\"
+    return "a"
+
+g = StateGraph(dict)
+g.add_node("alpha", alpha)
+g.add_node("beta", beta)
+"""
+
+
+def _entry_point_of(tmp_path: Path, body: str, name: str = "entry.py") -> str | None:
+    path = _write(tmp_path, name, _ENTRY_PREAMBLE + body)
+    graphs = find_graph_definitions(path)
+    assert len(graphs) == 1
+    return graphs[0].entry_point
+
+
+def test_entry_point_derived_from_a_lone_start_edge(tmp_path: Path):
+    """Exactly one normal START edge — the case QA-3-02 hit on 7/7 real graphs."""
+    assert _entry_point_of(tmp_path, 'g.add_edge(START, "alpha")\n') == "alpha"
+
+
+def test_entry_point_is_none_with_no_start_edge(tmp_path: Path):
+    """Zero START edges and no set_entry_point — nothing to derive from."""
+    assert _entry_point_of(tmp_path, 'g.add_edge("alpha", "beta")\n') is None
+
+
+def test_entry_point_is_none_with_parallel_entries(tmp_path: Path):
+    """Two START edges is a fan-out; a singular field cannot express it, so it must not guess."""
+    body = 'g.add_edge(START, "alpha")\ng.add_edge(START, "beta")\n'
+    assert _entry_point_of(tmp_path, body) is None
+
+
+def test_explicit_set_entry_point_still_wins(tmp_path: Path):
+    """Derivation only fills a field that is otherwise None — it never overwrites a stated value."""
+    body = 'g.set_entry_point("beta")\ng.add_edge(START, "alpha")\n'
+    assert _entry_point_of(tmp_path, body) == "beta"
+
+
+def test_both_idioms_produce_the_same_entry_point(tmp_path: Path):
+    """The equivalence DEC-015 exists to enforce, asserted directly."""
+    explicit = _entry_point_of(tmp_path, 'g.set_entry_point("alpha")\n', "explicit.py")
+    implicit = _entry_point_of(tmp_path, 'g.add_edge(START, "alpha")\n', "implicit.py")
+
+    assert explicit == implicit == "alpha"
+
+
+def test_conditional_start_edge_does_not_derive_an_entry_point(tmp_path: Path):
+    """A conditional entry's entry is a routing function, not a node — there is no name to report."""
+    body = 'g.add_conditional_edges(START, router, {"a": "alpha"})\n'
+    assert _entry_point_of(tmp_path, body) is None
+
+
+def test_start_to_end_edge_does_not_derive_a_sentinel_as_entry_point(tmp_path: Path):
+    """A degenerate START->END edge must not report '__end__' as the entry node."""
+    assert _entry_point_of(tmp_path, "g.add_edge(START, END)\n") is None
+
+
+def test_derivation_is_independent_of_call_order(tmp_path: Path):
+    """Derived at build time over the finished edge set, so source ordering cannot change it."""
+    before = _entry_point_of(
+        tmp_path, 'g.add_edge("alpha", "beta")\ng.add_edge(START, "alpha")\n', "before.py"
+    )
+    after = _entry_point_of(
+        tmp_path, 'g.add_edge(START, "alpha")\ng.add_edge("alpha", "beta")\n', "after.py"
+    )
+
+    assert before == after == "alpha"
