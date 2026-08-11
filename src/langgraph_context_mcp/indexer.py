@@ -19,7 +19,7 @@ from pathlib import Path
 from .embeddings.base import EmbeddingProvider
 from .embeddings.nomic_provider import NomicEmbeddingProvider
 from .parser.graph_model import RESOLUTION_PARTIAL, GraphDef, NodeDef
-from .parser.repo_scanner import scan_repository
+from .parser.repo_scanner import resolve_repo_root, scan_repository
 from .storage.base import (
     EmbeddingChunk,
     VectorStore,
@@ -69,11 +69,15 @@ def index_repository(
     repository with no LangGraph usage is a valid outcome — it is recorded as indexed with zero
     graphs, not an error.
 
-    Raises ``FileNotFoundError`` if the path does not exist and ``NotADirectoryError`` if it is
-    not a directory; both map to prd.md's ``index_repo`` error cases in the MCP layer.
+    Raises ``ValueError`` for an empty path or one containing ``..``, ``FileNotFoundError`` if the
+    path does not exist, and ``NotADirectoryError`` if it is not a directory. The latter two map to
+    prd.md's ``index_repo`` error cases in the MCP layer; the first is a third case Phase 4 must
+    name (DEC-014).
     """
     started = time.perf_counter()
-    repo_root = Path(repo_root).resolve()
+    # Validated here as well as inside scan_repository (DEC-014): failing at the entry point means
+    # no store and no embedding model are ever constructed for a path we were never going to scan.
+    repo_root = resolve_repo_root(repo_root)
     if not repo_root.exists():
         raise FileNotFoundError(f"Path does not exist: {repo_root}")
     if not repo_root.is_dir():

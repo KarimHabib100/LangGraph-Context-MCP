@@ -8,6 +8,11 @@ a new DEC entry, not a silent addition.
 
 A file with a syntax error (or an unreadable/non-UTF-8 file) is skipped with a warning; the
 scan of the rest of the repository continues. This function never raises on a bad file.
+
+This module is also where repo-path validation lives (DEC-014), because this is the point at
+which file I/O actually begins. ``resolve_repo_root`` rejects empty input and ``..`` traversal,
+and the walk additionally refuses to hand back any file that resolves outside the root — see
+claude.md's KEY ARCHITECTURAL RULES and RISK-SEC-001.
 """
 
 from __future__ import annotations
@@ -49,6 +54,45 @@ _DEFAULT_IGNORE_DIRS = frozenset(
 )
 
 
+def resolve_repo_root(repo_root: Path | str) -> Path:
+    """Validate a caller-supplied repository path and return it resolved and absolute.
+
+    This is the guard claude.md's KEY ARCHITECTURAL RULES require and RISK-SEC-001 names, applied
+    here because this module is where file I/O begins (DEC-014). Two rejections, both
+    ``ValueError``:
+
+    - **Empty or whitespace-only input.** ``Path("").resolve()`` silently means "the current
+      working directory", so a caller that named no directory would otherwise get an unrelated one
+      indexed and reported as a success (QA-3-07).
+    - **A ``..`` component in the argument.** Checked on the raw input, because resolving is what
+      destroys the evidence — ``<repo>/../../..`` resolves to a perfectly ordinary-looking absolute
+      path with nothing left to detect (QA-3-08).
+
+    Existence and directory-ness are deliberately *not* checked here: those belong to the caller
+    that wants to distinguish them (``index_repository`` raises ``FileNotFoundError`` /
+    ``NotADirectoryError``), and ``scan_repository`` keeps its existing empty-result behaviour for
+    a path that is not there.
+    """
+    if repo_root is None:
+        raise ValueError("Repository path is required, got None.")
+
+    raw = os.fspath(repo_root)
+    if not raw.strip():
+        raise ValueError(
+            "Repository path is empty or whitespace-only. Pass an explicit directory — an "
+            "empty path would silently resolve to the current working directory."
+        )
+
+    candidate = Path(raw)
+    if any(part == ".." for part in candidate.parts):
+        raise ValueError(
+            f"Repository path may not contain '..' path traversal: {raw!r}. "
+            f"Pass an absolute path, or run from inside the repository and use '.'."
+        )
+
+    return candidate.resolve()
+
+
 def scan_repository(repo_root: Path) -> list[GraphDef]:
     """Scan ``repo_root`` for LangGraph definitions and return every resolved ``GraphDef``.
 
@@ -56,8 +100,10 @@ def scan_repository(repo_root: Path) -> list[GraphDef]:
     ignore set), parses each with the AST walker, runs the bounded-depth cross-file resolver on
     every graph, and aggregates the results. A repo with no LangGraph usage returns an empty
     list — that is a valid, non-error outcome.
+
+    Raises ``ValueError`` for an empty path or one containing ``..`` (DEC-014).
     """
-    repo_root = repo_root.resolve()
+    repo_root = resolve_repo_root(repo_root)
     matcher = _GitignoreMatcher.load(repo_root)
 
     graphs: list[GraphDef] = []
@@ -101,7 +147,25 @@ def _iter_python_files(repo_root: Path, matcher: _GitignoreMatcher):
             rel = _rel_posix(file_path, repo_root)
             if matcher.is_ignored(rel, is_dir=False):
                 continue
+            if not _is_within(file_path, repo_root):
+                # A symlink inside the repo pointing out of it. `resolve_repo_root` cannot see
+                # this — the argument was legitimate; the escape is on disk (DEC-014, rule 3).
+                logger.warning(
+                    "Skipping %s: resolves outside the repository root %s", file_path, repo_root
+                )
+                continue
             yield file_path
+
+
+def _is_within(path: Path, repo_root: Path) -> bool:
+    """Whether ``path`` really lives under ``repo_root`` once symlinks are followed."""
+    try:
+        path.resolve().relative_to(repo_root)
+    except ValueError:
+        return False
+    except OSError:  # unreadable/broken link — treat as outside rather than guess
+        return False
+    return True
 
 
 def _rel_posix(path: Path, repo_root: Path) -> str:
