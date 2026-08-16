@@ -30,6 +30,19 @@ from .storage.factory import get_vector_store
 
 logger = logging.getLogger(__name__)
 
+# Cap on the padded volume of one embedding call, as `len(batch) * longest_member_chars`
+# (DEC-016). `fastembed` pads every member of a batch to its longest member and attention cost
+# scales with `batch_size * max_seq_len**2`, so embedding a whole repo at once is both slower than
+# batching it (2.3x on real code) and able to exhaust memory outright — a 273-chunk corpus with one
+# 5,521-char node attempted an 18.9 GB allocation and crashed.
+#
+# 4000 is the measured minimax choice across three chunk-length regimes: within 2% of the best
+# strategy on long/variable, short/uniform, and mixed corpora, where no fixed batch size does
+# better than 8.8% worst-case. Characters are a deliberate proxy for tokens — this is a bound, not
+# a target, so an approximation is safe and costs no tokenizer pass. Calibrated for
+# `nomic-embed-text-v1.5` on CPU; re-measure if DEC-003's default model changes.
+EMBED_BATCH_CHAR_BUDGET = 4000
+
 
 @dataclass(frozen=True)
 class IndexResult:
@@ -149,10 +162,75 @@ def build_chunk_text(node: NodeDef, repo_root: Path, source_cache: dict | None =
     return node.name
 
 
+def plan_embedding_batches(texts: list[str], budget: int | None = None) -> list[list[int]]:
+    """Group ``texts`` into length-sorted batches bounded by a padded-size budget (DEC-016).
+
+    Returns lists of indices into ``texts``. Sorting by length keeps each batch's members
+    near-uniform, so little is wasted on padding; the budget caps
+    ``len(batch) * longest_member``, which is the padded volume the model materialises and the
+    quantity that overflows memory when everything is embedded at once.
+
+    A text larger than the whole budget forms a batch of one. It is still embedded in full —
+    this function never drops or truncates a chunk (DEC-005).
+
+    ``budget`` defaults to ``EMBED_BATCH_CHAR_BUDGET``, resolved on each call rather than bound as
+    a default argument, so the module constant stays the single source of truth.
+    """
+    effective_budget = EMBED_BATCH_CHAR_BUDGET if budget is None else budget
+    order = sorted(range(len(texts)), key=lambda index: len(texts[index]))
+    batches: list[list[int]] = []
+    current: list[int] = []
+    longest = 0
+
+    for index in order:
+        candidate_longest = max(longest, len(texts[index]))
+        if current and (len(current) + 1) * candidate_longest > effective_budget:
+            batches.append(current)
+            current, longest = [index], len(texts[index])
+        else:
+            current.append(index)
+            longest = candidate_longest
+
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _embed_in_batches(texts: list[str], embedder: EmbeddingProvider) -> list[list[float]]:
+    """Embed ``texts`` in bounded batches, returning vectors in the caller's original order.
+
+    Batching is invisible to the caller: grouping changes only how the work is issued, never the
+    result. The model masks padded positions, so a chunk's vector does not depend on which batch
+    it landed in — asserted exactly, not within a tolerance, by the tests for DEC-016.
+    """
+    batches = plan_embedding_batches(texts)
+    logger.debug(
+        "Embedding %d chunks in %d batch(es) (budget %d chars)",
+        len(texts),
+        len(batches),
+        EMBED_BATCH_CHAR_BUDGET,
+    )
+
+    vectors: list[list[float] | None] = [None] * len(texts)
+    for batch in batches:
+        embedded = embedder.embed([texts[index] for index in batch])
+        if len(embedded) != len(batch):
+            raise RuntimeError(
+                f"Embedding provider returned {len(embedded)} vectors for {len(batch)} chunks."
+            )
+        for index, vector in zip(batch, embedded):
+            vectors[index] = vector
+
+    missing = [index for index, vector in enumerate(vectors) if vector is None]
+    if missing:
+        raise RuntimeError(f"No embedding produced for chunk index(es) {missing}.")
+    return [vector for vector in vectors if vector is not None]
+
+
 def _build_chunks(
     graphs: list[GraphDef], repo_root: Path, embedder: EmbeddingProvider
 ) -> list[EmbeddingChunk]:
-    """Build one chunk per node and embed them all in a single batched call."""
+    """Build one chunk per node and embed them in bounded batches (DEC-016)."""
     source_cache: dict[str, list[str] | None] = {}
     nodes: list[tuple[GraphDef, NodeDef]] = [
         (graph, node) for graph in graphs for node in graph.nodes
@@ -161,11 +239,7 @@ def _build_chunks(
         return []
 
     texts = [build_chunk_text(node, repo_root, source_cache) for _graph, node in nodes]
-    vectors = embedder.embed(texts)
-    if len(vectors) != len(texts):
-        raise RuntimeError(
-            f"Embedding provider returned {len(vectors)} vectors for {len(texts)} chunks."
-        )
+    vectors = _embed_in_batches(texts, embedder)
 
     return [
         EmbeddingChunk(

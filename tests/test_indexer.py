@@ -19,7 +19,13 @@ from langgraph_context_mcp.embeddings.nomic_provider import (
     DEFAULT_MODEL_NAME,
     NomicEmbeddingProvider,
 )
-from langgraph_context_mcp.indexer import build_chunk_text, index_repository
+from langgraph_context_mcp.indexer import (
+    EMBED_BATCH_CHAR_BUDGET,
+    _embed_in_batches,
+    build_chunk_text,
+    index_repository,
+    plan_embedding_batches,
+)
 from langgraph_context_mcp.storage.base import make_repo_id
 from langgraph_context_mcp.storage.sqlite_store import SqliteStore, default_index_path
 
@@ -96,14 +102,24 @@ def test_graph_structure_is_persisted(
     assert sqlite_store.get_graph(graph.id) == graph
 
 
-def test_embedding_is_one_batched_call(
+def test_embedding_is_issued_in_bounded_batches(
     fixture_repo: Path, sqlite_store, fake_embedder: FakeEmbeddingProvider
 ) -> None:
-    """All chunks go through the provider in a single call, per task 2.7."""
+    """Chunks are embedded in budget-bounded batches, not one call per repo (DEC-016).
+
+    Task 2.7 originally specified a single call; that is what RISK-009 / QA-3-01 measured as
+    2.3x slower than the floor and able to exhaust memory, so this asserts the opposite.
+    """
     index_repository(fixture_repo, store=sqlite_store, embedder=fake_embedder)
 
-    assert len(fake_embedder.embed_calls) == 1
-    assert len(fake_embedder.embed_calls[0]) == 4
+    # Every chunk is embedded exactly once, across however many calls the budget produced.
+    embedded = [text for call in fake_embedder.embed_calls for text in call]
+    assert len(embedded) == 4
+    assert len(set(embedded)) == 4
+
+    for call in fake_embedder.embed_calls:
+        padded_volume = len(call) * max(len(text) for text in call)
+        assert padded_volume <= EMBED_BATCH_CHAR_BUDGET or len(call) == 1
 
 
 def test_reindexing_is_idempotent(
@@ -303,12 +319,129 @@ def test_empty_batch_needs_no_model() -> None:
 
 
 # --------------------------------------------------------------------------------------------
+# Batching (DEC-016 / RISK-009)
+# --------------------------------------------------------------------------------------------
+def test_batches_respect_the_padded_size_budget() -> None:
+    """No batch may exceed `len(batch) * longest_member` unless it is a single oversized chunk."""
+    texts = ["x" * 100] * 40 + ["y" * 900] * 5 + ["z" * 3000]
+
+    for batch in plan_embedding_batches(texts):
+        longest = max(len(texts[index]) for index in batch)
+        assert len(batch) * longest <= EMBED_BATCH_CHAR_BUDGET or len(batch) == 1
+
+
+def test_batching_covers_every_chunk_exactly_once() -> None:
+    """A chunk must never be dropped or duplicated by grouping — the index would be wrong."""
+    texts = [f"{'a' * (i * 37)}" for i in range(60)]
+
+    flattened = [index for batch in plan_embedding_batches(texts) for index in batch]
+
+    assert sorted(flattened) == list(range(len(texts)))
+
+
+def test_oversized_chunk_gets_its_own_batch_and_is_never_truncated() -> None:
+    """A chunk bigger than the whole budget is still embedded in full (DEC-005)."""
+    giant = "g" * (EMBED_BATCH_CHAR_BUDGET * 5)
+    texts = ["small", giant, "also small"]
+    embedder = FakeEmbeddingProvider()
+
+    batches = plan_embedding_batches(texts)
+    _embed_in_batches(texts, embedder)
+
+    assert [texts[index] for index in next(b for b in batches if len(b) == 1)] == [giant]
+    embedded = [text for call in embedder.embed_calls for text in call]
+    assert giant in embedded  # in full, not a prefix
+
+
+def test_empty_input_produces_no_batches() -> None:
+    assert plan_embedding_batches([]) == []
+
+
+@pytest.mark.parametrize("budget", [1, 50, 500, 4000, 10**9])
+def test_vectors_are_identical_regardless_of_batch_grouping(budget: int) -> None:
+    """The core invariant of DEC-016: grouping changes only *how* work is issued, not the result.
+
+    Budgets from 1 (every chunk alone) to 10**9 (all chunks in one call) must all produce the
+    same vector for the same text, in the caller's original order. Exact equality — if this ever
+    needed a tolerance, an index built with one budget would be silently incomparable with a
+    query embedded under another.
+    """
+    # Lengths are deliberately NOT monotonic in index: if they were, length-sorted order would
+    # coincide with input order and the test could not detect a batch mapped back in the wrong
+    # order — which is the most likely way this code breaks.
+    texts = [
+        f"def node_{i}():\n    return {'x' * (((i * 7) % 25) * 53)}" for i in range(25)
+    ]
+    embedder = FakeEmbeddingProvider()
+
+    reference = [embedder.embed([text])[0] for text in texts]
+    regrouped = _embed_in_batches(texts, embedder)
+
+    with_budget: list[list[float]] = [[]] * len(texts)
+    for batch in plan_embedding_batches(texts, budget=budget):
+        for index, vector in zip(batch, embedder.embed([texts[index] for index in batch])):
+            with_budget[index] = vector
+
+    assert regrouped == reference
+    assert with_budget == reference
+
+
+def test_indexed_vectors_do_not_depend_on_the_budget(
+    fixture_repo: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """End to end: the vectors persisted for a repo are the same at any batch size."""
+
+    def scores_at(budget: int, name: str) -> list[tuple[str, float]]:
+        # `score` is cosine similarity against a fixed query vector, so it is a deterministic
+        # function of the stored embedding — the public surface through which a difference in
+        # the persisted vectors would actually reach a user.
+        monkeypatch.setattr("langgraph_context_mcp.indexer.EMBED_BATCH_CHAR_BUDGET", budget)
+        store = SqliteStore(tmp_path / name / "index.db", dimension=TEST_DIMENSION)
+        try:
+            index_repository(fixture_repo, store=store, embedder=FakeEmbeddingProvider())
+            results = store.search(
+                [1.0] * TEST_DIMENSION,
+                top_k=50,
+                filters={"repo_id": make_repo_id(fixture_repo)},
+            )
+            return sorted((result.node_name, result.score) for result in results)
+        finally:
+            store.close()
+
+    assert scores_at(1, "one") == scores_at(10**9, "unbounded")
+
+
+# --------------------------------------------------------------------------------------------
 # Phase 2 exit criterion — the real local model
 # --------------------------------------------------------------------------------------------
 @pytest.fixture(scope="session")
 def nomic_provider() -> NomicEmbeddingProvider:
     """The real provider, loaded once per session (the first use downloads the model)."""
     return NomicEmbeddingProvider()
+
+
+def test_real_model_vectors_are_identical_regardless_of_grouping(
+    nomic_provider: NomicEmbeddingProvider,
+) -> None:
+    """DEC-016's invariance claim against the genuine ONNX model, not the fake.
+
+    The fake embedder is per-text by construction, so it cannot detect batch bleed. This runs the
+    real model, whose padding *could* in principle perturb its neighbours, and asserts exact
+    equality — which is what was measured across every strategy and corpus in DEC-016.
+    """
+    texts = [
+        "def tiny(state): return state",
+        "def medium(state):\n" + '    """Does a moderate amount."""\n' * 12 + "    return state",
+        "def large(state):\n" + "    value = compute(state)  # padding driver\n" * 90 + "    return value",
+        "def small(state): return {}",
+    ]
+
+    one_at_a_time = [nomic_provider.embed([text])[0] for text in texts]
+    all_at_once = nomic_provider.embed(texts)
+    batched = _embed_in_batches(texts, nomic_provider)
+
+    assert all_at_once == one_at_a_time
+    assert batched == one_at_a_time
 
 
 def test_semantic_query_finds_the_authentication_node(
