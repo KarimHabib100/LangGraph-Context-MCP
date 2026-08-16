@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "langgraph-context": {
+      "command": "uvx",
+      "args": ["--from", ".", "langgraph-context-mcp", "serve"]
+    }
+  }
+}
