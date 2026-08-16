@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .graph_model import (
+    CONDITION_VALUE_KNOWN,
+    CONDITION_VALUE_NOT_DERIVABLE,
     EDGE_CONDITIONAL,
     EDGE_NORMAL,
     END_SENTINEL,
@@ -416,11 +418,18 @@ def _handle_add_conditional(
         # Conditional edge whose branches cannot be statically enumerated (mapping is a
         # variable, omitted, or the router returns node names directly). Record the edge's
         # existence so it is never silently dropped, but with no enumerable routes.
-        destinations = [(_UNRESOLVED_TARGET, _UNRESOLVED_TARGET)]
+        destinations = [(_UNRESOLVED_TARGET, _UNRESOLVED_TARGET, CONDITION_VALUE_NOT_DERIVABLE)]
 
-    for condition_value, target_name in destinations:
+    for condition_value, target_name, value_resolution in destinations:
+        # The ID keeps using the destination name when there is no condition value, so every
+        # edge ID generated before DEC-017 is byte-identical and no existing index is invalidated.
+        # This is an opaque uniqueness key, not a semantic claim.
         edge_id = make_edge_id(
-            builder.graph_id, source_name, target_name, EDGE_CONDITIONAL, condition_value
+            builder.graph_id,
+            source_name,
+            target_name,
+            EDGE_CONDITIONAL,
+            condition_value if condition_value is not None else target_name,
         )
         builder.add_edge(
             EdgeDef(
@@ -439,6 +448,7 @@ def _handle_add_conditional(
                     edge_id=edge_id,
                     condition_value=condition_value,
                     target_node_id=make_node_id(builder.graph_id, target_name),
+                    value_resolution=value_resolution,
                 )
             )
 
@@ -498,29 +508,38 @@ def _parse_add_node_args(call: ast.Call) -> tuple[str | None, bool, ast.AST | No
 
 def _extract_mapping(
     mapping: ast.AST | None, start_names: set[str], end_names: set[str]
-) -> list[tuple[str, str]]:
-    """Extract ``(condition_value, target_name)`` pairs from an add_conditional_edges mapping.
+) -> list[tuple[str | None, str, str]]:
+    """Extract ``(condition_value, target_name, value_resolution)`` triples from a mapping.
 
-    Supports a dict literal ``{"a": "node_a"}`` and a list literal ``["node_a", "node_b"]``
-    (where each element is both the condition value and the target). Anything else yields an
-    empty list, which the caller records as an unresolved conditional edge.
+    The two supported forms mean different things, and DEC-017 keeps them distinct:
+
+    - A dict literal ``{"a": "node_a"}`` is a real mapping — the key *is* the router's return
+      value, so it is recorded with ``CONDITION_VALUE_KNOWN``.
+    - A list/tuple ``["node_a", "node_b"]`` is a *destination hint*. It states where the router
+      may route, never what it returns (a real router may return ``Send`` objects, which are not
+      node names at all), so ``condition_value`` is ``None`` and the route is marked
+      ``CONDITION_VALUE_NOT_DERIVABLE`` rather than labelled with the destination's own name.
+
+    Anything else yields an empty list, which the caller records as an unresolved conditional edge.
     """
     if isinstance(mapping, ast.Dict):
-        pairs: list[tuple[str, str]] = []
+        pairs: list[tuple[str | None, str, str]] = []
         for key, value in zip(mapping.keys, mapping.values):
             if key is None:  # dict unpacking (**other) — cannot enumerate
                 continue
             condition_value = _constant_str(key)
             target_name = _resolve_node_ref(value, start_names, end_names)
             if condition_value is None:
+                # A non-literal key is still genuinely the compared value, just not a bare
+                # constant — so it stays `known`, unparsed for display.
                 condition_value = _safe_unparse(key)
-            pairs.append((condition_value, target_name))
+            pairs.append((condition_value, target_name, CONDITION_VALUE_KNOWN))
         return pairs
     if isinstance(mapping, (ast.List, ast.Tuple)):
         pairs = []
         for element in mapping.elts:
             target_name = _resolve_node_ref(element, start_names, end_names)
-            pairs.append((target_name, target_name))
+            pairs.append((None, target_name, CONDITION_VALUE_NOT_DERIVABLE))
         return pairs
     return []
 

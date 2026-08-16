@@ -12,6 +12,7 @@ import json
 import pytest
 
 from langgraph_context_mcp.parser.graph_model import (
+    CONDITION_VALUE_KNOWN,
     EDGE_CONDITIONAL,
     EDGE_NORMAL,
     RESOLUTION_FULL,
@@ -64,6 +65,7 @@ def route() -> ConditionalRoute:
         edge_id="f.py::g::cedge::a--ok-->b",
         condition_value="ok",
         target_node_id="f.py::g::node::b",
+        value_resolution=CONDITION_VALUE_KNOWN,
     )
 
 
@@ -112,6 +114,7 @@ def test_route_to_dict_shape(route: ConditionalRoute):
         "edge_id": "f.py::g::cedge::a--ok-->b",
         "condition_value": "ok",
         "target_node_id": "f.py::g::node::b",
+        "value_resolution": "known",
     }
 
 

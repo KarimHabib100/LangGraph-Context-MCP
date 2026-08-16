@@ -40,6 +40,14 @@ TOOL_RESOLUTION_FULL = "full"
 TOOL_RESOLUTION_PARTIAL = "partial"
 TOOL_RESOLUTION_NOT_APPLICABLE = "not_applicable"
 
+# Certainty of a ConditionalRoute's `condition_value`, kept in its own field for the same reason
+# `tool_resolution` is separate from `resolution` (DEC-008):
+#   known         — the mapping was a dict literal, so the key IS the router's return value
+#   not_derivable — the mapping was a list/tuple destination hint, which states where the router
+#                   may route but never what it returns. `condition_value` is None (DEC-017)
+CONDITION_VALUE_KNOWN = "known"
+CONDITION_VALUE_NOT_DERIVABLE = "not_derivable"
+
 # Edge types.
 EDGE_NORMAL = "normal"
 EDGE_CONDITIONAL = "conditional"
@@ -149,12 +157,20 @@ class EdgeDef:
 
 @dataclass(frozen=True)
 class ConditionalRoute:
-    """One branch of a conditional edge: a condition return value and where it routes to."""
+    """One branch of a conditional edge: where it routes to, and the value that triggers it.
+
+    ``condition_value`` is ``None`` whenever the source did not state it — a list/tuple
+    ``path_map`` is a destination hint, not a return-value mapping, so there is no truthful value
+    to report (DEC-017). ``value_resolution`` says which case this is, rather than leaving a bare
+    ``None`` to be read as "unknown", "not applicable", or "the parser failed" interchangeably.
+    The destination is always known either way.
+    """
 
     id: str
     edge_id: str
-    condition_value: str
+    condition_value: str | None
     target_node_id: str
+    value_resolution: str  # CONDITION_VALUE_KNOWN | CONDITION_VALUE_NOT_DERIVABLE
 
     def to_dict(self) -> dict:
         return {
@@ -162,6 +178,7 @@ class ConditionalRoute:
             "edge_id": self.edge_id,
             "condition_value": self.condition_value,
             "target_node_id": self.target_node_id,
+            "value_resolution": self.value_resolution,
         }
 
 

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from langgraph_context_mcp.embeddings.base import EmbeddingProvider
 from langgraph_context_mcp.parser.graph_model import (
+    CONDITION_VALUE_KNOWN,
     EDGE_CONDITIONAL,
     EDGE_NORMAL,
     RESOLUTION_FULL,
@@ -128,6 +129,7 @@ def build_graph(repo_id: str, token: str, node_names: list[str]) -> GraphDef:
                 edge_id=conditional_id,
                 condition_value="retry",
                 target_node_id=make_node_id(graph_id, first),
+                value_resolution=CONDITION_VALUE_KNOWN,
             )
         )
 

@@ -15,6 +15,8 @@ import pytest
 
 from langgraph_context_mcp.parser.ast_walker import find_graph_definitions
 from langgraph_context_mcp.parser.graph_model import (
+    CONDITION_VALUE_KNOWN,
+    CONDITION_VALUE_NOT_DERIVABLE,
     EDGE_CONDITIONAL,
     EDGE_NORMAL,
     END_SENTINEL,
@@ -24,6 +26,7 @@ from langgraph_context_mcp.parser.graph_model import (
     TOOL_RESOLUTION_FULL,
     TOOL_RESOLUTION_NOT_APPLICABLE,
     TOOL_RESOLUTION_PARTIAL,
+    make_edge_id,
     make_node_id,
 )
 from langgraph_context_mcp.parser.repo_scanner import scan_repository
@@ -147,10 +150,138 @@ g.add_conditional_edges(
 
     route_map = {r.condition_value: _endpoint(graph.id, r.target_node_id) for r in graph.conditional_routes}
     assert route_map == {"to_a": "a", "to_b": "b", "to_c": "c", "done": END_SENTINEL}
+    # A dict literal genuinely states the router's return values (DEC-017).
+    assert {r.value_resolution for r in graph.conditional_routes} == {CONDITION_VALUE_KNOWN}
 
 
 def _endpoint(graph_id: str, node_id: str) -> str:
     return node_id[len(f"{graph_id}::node::"):]
+
+
+# --------------------------------------------------------------------------------------------
+# List-form path_map — destination hint, not a return-value mapping (QA-3-04 / DEC-017)
+# --------------------------------------------------------------------------------------------
+def test_list_form_conditional_records_no_condition_value(tmp_path: Path):
+    """The exact shape from `open_deep_research` `src/legacy/graph.py:499`.
+
+    The router returns `Send(...)` objects, so the destination name is emphatically NOT the
+    value it returns. Before DEC-017 the parser recorded `condition_value="write_final_sections"`,
+    which `explain_conditional` would have stated as the router's return value — a fact the
+    function never produces.
+    """
+    src = '''
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
+
+
+def gather_completed_sections(state):
+    return state
+
+
+def write_final_sections(state):
+    return state
+
+
+def initiate_final_section_writing(state):
+    return [
+        Send("write_final_sections", {"topic": state["topic"], "section": s})
+        for s in state["sections"]
+    ]
+
+
+builder = StateGraph(dict)
+builder.add_node("gather_completed_sections", gather_completed_sections)
+builder.add_node("write_final_sections", write_final_sections)
+builder.add_conditional_edges(
+    "gather_completed_sections", initiate_final_section_writing, ["write_final_sections"]
+)
+'''
+    path = _write(tmp_path, "send_router.py", src)
+    graph = find_graph_definitions(path)[0]
+
+    assert len(graph.conditional_routes) == 1
+    route = graph.conditional_routes[0]
+
+    # The claim that was fabricated is gone...
+    assert route.condition_value is None
+    assert route.value_resolution == CONDITION_VALUE_NOT_DERIVABLE
+    # ...while the destination, which was always correct, is unchanged.
+    assert _endpoint(graph.id, route.target_node_id) == "write_final_sections"
+
+    conditional = [e for e in graph.edges if e.type == EDGE_CONDITIONAL]
+    assert len(conditional) == 1
+    assert conditional[0].condition_function_name == "initiate_final_section_writing"
+
+
+def test_list_form_keeps_every_destination(tmp_path: Path):
+    """Multiple destinations still produce one route each (DEC-006), all `not_derivable`."""
+    src = '''
+from langgraph.graph import StateGraph, END
+
+
+def router(state):
+    return "anything at all"
+
+
+def a(state):
+    return state
+
+
+def b(state):
+    return state
+
+
+g = StateGraph(dict)
+g.add_node("a", a)
+g.add_node("b", b)
+g.add_conditional_edges("a", router, ["a", "b", END])
+'''
+    path = _write(tmp_path, "listform.py", src)
+    graph = find_graph_definitions(path)[0]
+
+    assert len(graph.conditional_routes) == 3
+    assert all(r.condition_value is None for r in graph.conditional_routes)
+    assert all(
+        r.value_resolution == CONDITION_VALUE_NOT_DERIVABLE for r in graph.conditional_routes
+    )
+    assert {_endpoint(graph.id, r.target_node_id) for r in graph.conditional_routes} == {
+        "a",
+        "b",
+        END_SENTINEL,
+    }
+
+
+def test_list_form_edge_ids_are_unchanged_by_dec_017(tmp_path: Path):
+    """Edge IDs must stay byte-identical, or every previously built index is invalidated."""
+    src = '''
+from langgraph.graph import StateGraph
+
+
+def router(state):
+    return "x"
+
+
+def a(state):
+    return state
+
+
+def b(state):
+    return state
+
+
+g = StateGraph(dict)
+g.add_node("a", a)
+g.add_node("b", b)
+g.add_conditional_edges("a", router, ["a", "b"])
+'''
+    path = _write(tmp_path, "ids.py", src)
+    graph = find_graph_definitions(path)[0]
+
+    # The pre-DEC-017 ID used the destination name in the condition slot; it still does.
+    expected = {
+        make_edge_id(graph.id, "a", target, EDGE_CONDITIONAL, target) for target in ("a", "b")
+    }
+    assert {e.id for e in graph.edges if e.type == EDGE_CONDITIONAL} == expected
 
 
 # --------------------------------------------------------------------------------------------
