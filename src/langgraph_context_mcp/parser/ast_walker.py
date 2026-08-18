@@ -1071,7 +1071,9 @@ def _import_modules(tree: ast.AST) -> dict[str, str]:
 # --------------------------------------------------------------------------------------------
 def _parse_file(file_path: Path) -> tuple[str, ast.Module] | None:
     try:
-        source = file_path.read_text(encoding="utf-8")
+        # utf-8-sig strips a leading UTF-8 BOM if present (DEC-022) and is a no-op otherwise, so a
+        # file saved with a BOM by a common Windows-native editor is not misread as invalid syntax.
+        source = file_path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError) as exc:
         logger.warning("Skipping %s: cannot read as UTF-8 (%s)", file_path, exc)
         return None

@@ -275,7 +275,9 @@ def _source_lines(
 
     lines: list[str] | None
     try:
-        lines = candidate.read_text(encoding="utf-8").splitlines()
+        # utf-8-sig strips a leading UTF-8 BOM if present (DEC-022), same reasoning as
+        # ast_walker._parse_file: a no-op when absent, so this never changes non-BOM output.
+        lines = candidate.read_text(encoding="utf-8-sig").splitlines()
     except (OSError, UnicodeDecodeError) as exc:
         logger.warning("Could not read %s for chunking (%s)", source_file, exc)
         lines = None

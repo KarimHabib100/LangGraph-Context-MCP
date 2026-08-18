@@ -416,6 +416,117 @@ g.add_node("only_node", only_node)
 
 
 # --------------------------------------------------------------------------------------------
+# UTF-8 BOM handling (DEC-022 / QA-5-06): a BOM is not a syntax error, and must not hide one
+# --------------------------------------------------------------------------------------------
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+_VALID_SOURCE = """
+from langgraph.graph import StateGraph
+
+
+def only_node(state):
+    return state
+
+
+g = StateGraph(dict)
+g.add_node("only_node", only_node)
+"""
+
+
+def test_bom_prefixed_valid_file_parses_correctly(tmp_path: Path):
+    """A file saved with a UTF-8 BOM is valid Python (`python file.py` runs it fine); the
+    parser must not misreport it as a syntax error and drop its graph (QA-5-06)."""
+    path = tmp_path / "bom_ok.py"
+    path.write_bytes(_UTF8_BOM + _VALID_SOURCE.encode("utf-8"))
+
+    graphs = find_graph_definitions(path)
+
+    assert len(graphs) == 1
+    assert _node_names(graphs[0]) == {"only_node"}
+    assert graphs[0].nodes[0].resolution == RESOLUTION_FULL
+
+
+def test_bom_prefixed_file_matches_non_bom_output_exactly(tmp_path: Path):
+    """Same source, with and without a BOM, must produce identical graph output — the BOM
+    carries no information, so it must not change what is extracted."""
+    plain_path = tmp_path / "plain.py"
+    plain_path.write_text(_VALID_SOURCE, encoding="utf-8")
+    bom_path = tmp_path / "bom.py"
+    bom_path.write_bytes(_UTF8_BOM + _VALID_SOURCE.encode("utf-8"))
+
+    plain_graphs = find_graph_definitions(plain_path)
+    bom_graphs = find_graph_definitions(bom_path)
+
+    assert len(plain_graphs) == len(bom_graphs) == 1
+    plain_node, bom_node = plain_graphs[0].nodes[0], bom_graphs[0].nodes[0]
+    # function_body_hash must match: the BOM must not leak into what gets hashed/embedded.
+    assert plain_node.function_body_hash == bom_node.function_body_hash
+    assert plain_node.line_start == bom_node.line_start
+    assert plain_node.line_end == bom_node.line_end
+
+
+def test_bom_prefixed_file_with_a_genuine_syntax_error_is_still_skipped(tmp_path: Path):
+    """Stripping the BOM must not swallow a real syntax error elsewhere in the same file —
+    the fix removes BOM noise only, it must not widen what counts as 'valid'."""
+    path = tmp_path / "bom_broken.py"
+    path.write_bytes(_UTF8_BOM + b"def oops(:\n    return\n")
+
+    graphs = find_graph_definitions(path)
+
+    assert graphs == []  # still reported as invalid, not silently treated as empty-but-fine
+
+
+def test_non_utf8_source_file_is_skipped_not_crashed(tmp_path: Path):
+    """A genuinely non-UTF-8-encoded file (e.g. Windows-1252 with an accented byte outside
+    UTF-8's valid ranges) must still be skipped gracefully — utf-8-sig only changes BOM
+    handling, not multi-byte validation, so this must behave exactly as before DEC-022."""
+    path = tmp_path / "cp1252.py"
+    # 'é' as a single cp1252 byte (0xE9) is not valid UTF-8 on its own.
+    path.write_bytes(b"# caf\xe9\ndef node(state):\n    return state\n")
+
+    graphs = find_graph_definitions(path)  # must not raise
+
+    assert graphs == []
+
+
+def test_bom_prefixed_cross_file_module_resolves_to_full(tmp_path: Path):
+    """The fix lives in the one shared `_parse_file()` helper, so a BOM in a module reached
+    through cross-file resolution (resolver.py) must resolve to `full`, not `partial` — not
+    just same-file scanning."""
+    _write(tmp_path, "agent/__init__.py", "")
+    nodes_path = tmp_path / "agent" / "nodes.py"
+    nodes_path.parent.mkdir(parents=True, exist_ok=True)
+    nodes_path.write_bytes(
+        _UTF8_BOM
+        + b'''
+def alpha(state):
+    """Alpha node docstring."""
+    return state
+'''
+    )
+    _write(
+        tmp_path,
+        "agent/graph.py",
+        '''
+from langgraph.graph import StateGraph
+
+from .nodes import alpha
+
+g = StateGraph(dict)
+g.add_node("alpha", alpha)
+''',
+    )
+
+    graphs = scan_repository(tmp_path)
+
+    assert len(graphs) == 1
+    node = graphs[0].nodes[0]
+    assert node.name == "alpha"
+    assert node.resolution == RESOLUTION_FULL  # not "partial" — the BOM must not defeat resolution
+    assert node.docstring == "Alpha node docstring."
+
+
+# --------------------------------------------------------------------------------------------
 # Malformed conditional mapping -> partial/best-effort, never a crash (RISK-001)
 # --------------------------------------------------------------------------------------------
 def test_conditional_edges_with_non_literal_mapping_records_unresolved(tmp_path: Path):

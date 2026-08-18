@@ -284,6 +284,32 @@ def test_chunk_text_includes_decorators(tmp_path: Path) -> None:
     assert "def trace(func):" not in text  # the decorator's own definition is not swept in
 
 
+def test_chunk_text_from_a_bom_prefixed_file_has_no_leaked_bom_character(tmp_path: Path) -> None:
+    """DEC-022: `_source_lines` reads with `utf-8-sig`, same as `ast_walker._parse_file`, so a
+    node whose span starts at line 1 of a BOM'd file does not get a stray U+FEFF prepended to
+    its embedded chunk text."""
+    source = tmp_path / "bom_first_line.py"
+    source.write_bytes(
+        b"\xef\xbb\xbf"
+        b'def first_line_node(state):\n'
+        b'    """A node whose def is the very first line of the file."""\n'
+        b"    return state\n"
+        b"\n"
+        b"from langgraph.graph import StateGraph\n"
+        b"graph = StateGraph(dict)\n"
+        b'graph.add_node("first_line_node", first_line_node)\n'
+    )
+
+    from langgraph_context_mcp.parser.repo_scanner import scan_repository
+
+    graph = scan_repository(tmp_path)[0]
+    node = next(node for node in graph.nodes if node.name == "first_line_node")
+    text = build_chunk_text(node, tmp_path)
+
+    assert "﻿" not in text
+    assert text.startswith("def first_line_node")
+
+
 def test_chunk_text_falls_back_when_the_file_is_gone(
     fixture_repo: Path, sqlite_store, fake_embedder: FakeEmbeddingProvider
 ) -> None:
