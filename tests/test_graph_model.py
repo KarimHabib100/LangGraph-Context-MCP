@@ -94,7 +94,31 @@ def test_node_to_dict_shape(node: NodeDef):
         "function_body_hash": "abc123",
         "resolution": "full",
         "tool_resolution": "not_applicable",
+        "routing_resolution": "not_applicable",
     }
+
+
+def test_node_routing_resolution_defaults_so_a_pre_dec020_index_rehydrates():
+    """A NodeDef dict written before DEC-020 has no `routing_resolution` key.
+
+    `storage/base.py::graph_from_dict` rehydrates with `NodeDef(**node)`, so the field must
+    default rather than raise — otherwise shipping DEC-020 would make every existing index
+    unreadable instead of merely out of date.
+    """
+    legacy = {
+        "id": "f.py::g::node::n",
+        "graph_id": "f.py::g",
+        "name": "n",
+        "source_file": "f.py",
+        "line_start": 10,
+        "line_end": 20,
+        "docstring": None,
+        "function_body_hash": "abc123",
+        "resolution": "full",
+        "tool_resolution": "not_applicable",
+    }
+    node = NodeDef(**legacy)
+    assert node.routing_resolution == "not_applicable"
 
 
 def test_edge_to_dict_shape(edge: EdgeDef):

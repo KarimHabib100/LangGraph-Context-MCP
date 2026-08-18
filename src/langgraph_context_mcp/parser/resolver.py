@@ -22,7 +22,9 @@ from .ast_walker import (
     _display_path,
     _hash_segment,
     _parse_file,
+    build_routing_edges,
     collect_node_function_refs,
+    extract_routing_from_funcdef,
     extract_tools_from_funcdef,
     function_line_start,
 )
@@ -68,6 +70,8 @@ def resolve_cross_file_references(graph_def: GraphDef, repo_root: Path) -> Graph
 
     upgrades = {}
     new_bindings = []
+    new_edges = []
+    new_routes = []
     for node in graph_def.nodes:
         if node.resolution != RESOLUTION_PARTIAL:
             continue
@@ -91,6 +95,9 @@ def resolve_cross_file_references(graph_def: GraphDef, repo_root: Path) -> Graph
         # enumeration state is tracked independently in `tool_resolution`: a cross-file body may
         # bind tools via a variable or a non-resolvable element, which makes it partial.
         bindings, tool_resolution = extract_tools_from_funcdef(node.id, funcdef, module_tree)
+        # Command(goto=...) routing in the cross-file body (DEC-020). Sentinels resolve against
+        # the *defining* module's imports, which is why this runs here and not at the call site.
+        destinations, routing_resolution = extract_routing_from_funcdef(funcdef, module_tree)
         upgrades[node.name] = replace(
             node,
             source_file=display_path,
@@ -100,18 +107,34 @@ def resolve_cross_file_references(graph_def: GraphDef, repo_root: Path) -> Graph
             function_body_hash=_hash_segment(source, funcdef),
             resolution=RESOLUTION_FULL,
             tool_resolution=tool_resolution,
+            routing_resolution=routing_resolution,
         )
         new_bindings.extend(bindings)
+        edges, routes = build_routing_edges(graph_def.id, node.name, destinations)
+        new_edges.extend(edges)
+        new_routes.extend(routes)
 
-    if not upgrades and not new_bindings:
+    if not upgrades and not new_bindings and not new_edges:
         return graph_def
 
     new_nodes = tuple(upgrades.get(node.name, node) for node in graph_def.nodes)
     merged_bindings = {binding.id: binding for binding in graph_def.tool_bindings}
     for binding in new_bindings:
         merged_bindings.setdefault(binding.id, binding)
+    # Keyed by deterministic ID, so a routing edge that restates one the builder already declared
+    # collapses onto it rather than duplicating it (DEC-020).
+    merged_edges = {edge.id: edge for edge in graph_def.edges}
+    for edge in new_edges:
+        merged_edges.setdefault(edge.id, edge)
+    merged_routes = {route.id: route for route in graph_def.conditional_routes}
+    for route in new_routes:
+        merged_routes.setdefault(route.id, route)
     return replace(
-        graph_def, nodes=new_nodes, tool_bindings=tuple(merged_bindings.values())
+        graph_def,
+        nodes=new_nodes,
+        edges=tuple(merged_edges.values()),
+        conditional_routes=tuple(merged_routes.values()),
+        tool_bindings=tuple(merged_bindings.values()),
     )
 
 

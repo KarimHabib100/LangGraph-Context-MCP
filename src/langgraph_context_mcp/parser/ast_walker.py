@@ -32,6 +32,9 @@ from .graph_model import (
     RESOLUTION_FULL,
     RESOLUTION_NOT_APPLICABLE,
     RESOLUTION_PARTIAL,
+    ROUTING_RESOLUTION_FULL,
+    ROUTING_RESOLUTION_NOT_APPLICABLE,
+    ROUTING_RESOLUTION_PARTIAL,
     START_SENTINEL,
     TOOL_RESOLUTION_FULL,
     TOOL_RESOLUTION_NOT_APPLICABLE,
@@ -55,6 +58,11 @@ _ADD_NODE = "add_node"
 _ADD_EDGE = "add_edge"
 _ADD_CONDITIONAL = "add_conditional_edges"
 _SET_ENTRY_POINT = "set_entry_point"
+
+# Routing constructs returned from a node function body rather than declared on the builder
+# (DEC-020). ``Send`` appears inside a ``goto=`` comprehension for parallel fan-out.
+_COMMAND = "Command"
+_SEND = "Send"
 
 # Tool-binding constructs detected per DEC-007: the LangGraph prebuilt ``ToolNode([...])`` and
 # any ``<x>.bind_tools([...])`` call.
@@ -127,6 +135,8 @@ def find_graph_definitions(
     start_names = _names_for(aliases, "START")
     end_names = _names_for(aliases, "END")
     toolnode_names = _names_for(aliases, "ToolNode")
+    send_names = _names_for(aliases, _SEND)
+    command_names = _names_for(aliases, _COMMAND)
     import_modules = _import_modules(tree)
 
     parents = _parent_map(tree)
@@ -159,6 +169,8 @@ def find_graph_definitions(
                 start_names=start_names,
                 end_names=end_names,
                 toolnode_names=toolnode_names,
+                send_names=send_names,
+                command_names=command_names,
                 import_modules=import_modules,
             )
         except _EXTRACTION_ERRORS as exc:  # never let one odd call abort the whole file
@@ -227,6 +239,9 @@ class _GraphBuilder:
         self._edges: dict[str, EdgeDef] = {}
         self._routes: dict[str, ConditionalRoute] = {}
         self._tool_bindings: dict[str, ToolBinding] = {}
+        # node name -> Command(goto=...) destinations, turned into edges at build() time so
+        # synthesis sees the finished node set rather than depending on call order (DEC-020).
+        self._routing: dict[str, list[str]] = {}
 
     def add_node(self, node: NodeDef) -> None:
         self._nodes.setdefault(node.name, node)  # first registration wins
@@ -240,7 +255,22 @@ class _GraphBuilder:
     def add_tool_binding(self, binding: ToolBinding) -> None:
         self._tool_bindings.setdefault(binding.id, binding)
 
+    def add_routing(self, node_name: str, destinations: list[str]) -> None:
+        if destinations:
+            self._routing.setdefault(node_name, destinations)
+
     def build(self) -> GraphDef:
+        # Command(goto=...) edges are synthesized here, not when the add_node call was seen, so
+        # they land in the same edge set as the builder-declared ones. `setdefault` keying on the
+        # deterministic edge ID means a Command edge that restates an add_edge-declared edge
+        # collapses onto it instead of double-counting (DEC-020).
+        for node_name, destinations in self._routing.items():
+            edges, routes = build_routing_edges(self.graph_id, node_name, destinations)
+            for edge in edges:
+                self.add_edge(edge)
+            for route in routes:
+                self.add_route(route)
+
         return GraphDef(
             id=self.graph_id,
             repo_id=self.repo_id,
@@ -294,11 +324,23 @@ def _apply_call(
     start_names: set[str],
     end_names: set[str],
     toolnode_names: set[str],
+    send_names: set[str],
+    command_names: set[str],
     import_modules: dict[str, str],
 ) -> None:
     if method == _ADD_NODE:
         _handle_add_node(
-            builder, call, source, local_functions, parents, toolnode_names, import_modules
+            builder,
+            call,
+            source,
+            local_functions,
+            parents,
+            toolnode_names,
+            send_names,
+            command_names,
+            start_names,
+            end_names,
+            import_modules,
         )
     elif method == _ADD_EDGE:
         _handle_add_edge(builder, call, start_names, end_names)
@@ -315,6 +357,10 @@ def _handle_add_node(
     local_functions: dict[str, ast.AST],
     parents: dict[ast.AST, ast.AST],
     toolnode_names: set[str],
+    send_names: set[str],
+    command_names: set[str],
+    start_names: set[str],
+    end_names: set[str],
     import_modules: dict[str, str],
 ) -> None:
     name, dynamic_name, func_arg = _parse_add_node_args(call)
@@ -358,6 +404,20 @@ def _handle_add_node(
         tool_args.append(func_arg.args[0])
     bindings, tool_resolution = _extract_tools(node_id, tool_args, import_modules)
 
+    # Command(goto=...) routing declared in the node's own body (DEC-020). Cross-file bodies are
+    # handled in resolver.py through the same helpers.
+    if resolution == RESOLUTION_FULL:
+        destinations, routing_resolution = _extract_routing(
+            funcdef, start_names, end_names, send_names, command_names
+        )
+    elif resolution == RESOLUTION_NOT_APPLICABLE:
+        # A bare ToolNode action is not a function, so there is no body that could route.
+        destinations, routing_resolution = [], ROUTING_RESOLUTION_NOT_APPLICABLE
+    else:
+        # The function exists but was not located, so its body was never visible. Reporting
+        # "does not route" here would be a guess; the resolver may upgrade this later.
+        destinations, routing_resolution = [], ROUTING_RESOLUTION_PARTIAL
+
     builder.add_node(
         NodeDef(
             id=node_id,
@@ -370,8 +430,10 @@ def _handle_add_node(
             function_body_hash=body_hash,
             resolution=resolution,
             tool_resolution=tool_resolution,
+            routing_resolution=routing_resolution,
         )
     )
+    builder.add_routing(name, destinations)
 
     for binding in bindings:
         builder.add_tool_binding(binding)
@@ -615,6 +677,180 @@ def _callable_name(value: ast.AST | None) -> str | None:
 # --------------------------------------------------------------------------------------------
 # Tool-binding extraction (DEC-007)
 # --------------------------------------------------------------------------------------------
+def extract_routing_from_funcdef(
+    funcdef: ast.AST | None, module_tree: ast.AST
+) -> tuple[list[str], str]:
+    """Extract the destinations a node function routes to via ``Command(goto=...)`` (DEC-020).
+
+    Public entry point used by both resolution sites — the same-file walker and the cross-file
+    resolver — so a construct behaves identically wherever the function lives.
+
+    Returns ``(destination_names, routing_resolution)``. Destinations are de-duplicated and keep
+    first-seen order. ``START``/``END`` resolve through ``module_tree``'s own import aliases, so
+    ``goto=END`` and ``add_edge(x, END)`` agree on the sentinel. Never raises.
+    """
+    if funcdef is None:
+        return [], ROUTING_RESOLUTION_NOT_APPLICABLE
+    aliases = _import_aliases(module_tree)
+    return _extract_routing(
+        funcdef,
+        start_names=_names_for(aliases, "START"),
+        end_names=_names_for(aliases, "END"),
+        send_names=_names_for(aliases, _SEND),
+        command_names=_names_for(aliases, _COMMAND),
+    )
+
+
+def _extract_routing(
+    funcdef: ast.AST | None,
+    start_names: set[str],
+    end_names: set[str],
+    send_names: set[str],
+    command_names: set[str],
+) -> tuple[list[str], str]:
+    """Core of ``extract_routing_from_funcdef``, over already-resolved import aliases.
+
+    The same-file walker has these name sets in hand already; the cross-file resolver derives
+    them from the defining module. Both share this body so detection cannot drift between them.
+    """
+    if funcdef is None:
+        return [], ROUTING_RESOLUTION_NOT_APPLICABLE
+
+    destinations: list[str] = []
+    saw_goto = False
+    unresolved = False
+
+    for call in ast.walk(funcdef):
+        if not isinstance(call, ast.Call) or not _is_named_call(call.func, command_names):
+            continue
+        goto = _keyword(call, "goto")
+        if goto is None:
+            continue  # e.g. Command(resume=True) — resumption, not routing
+        saw_goto = True
+        resolved, ok = _resolve_goto_targets(goto, start_names, end_names, send_names)
+        if not ok:
+            unresolved = True
+        for name in resolved:
+            if name not in destinations:
+                destinations.append(name)
+
+    if not saw_goto:
+        return [], ROUTING_RESOLUTION_NOT_APPLICABLE
+    return destinations, (
+        ROUTING_RESOLUTION_PARTIAL if unresolved else ROUTING_RESOLUTION_FULL
+    )
+
+
+def _resolve_goto_targets(
+    value: ast.AST, start_names: set[str], end_names: set[str], send_names: set[str]
+) -> tuple[list[str], bool]:
+    """Resolve one ``goto=`` value into node names. Returns ``(names, fully_resolved)``.
+
+    The shapes are exactly those the DEC-020 census measured on real code: a literal string, the
+    bare ``END``/``START`` sentinel name, a sequence of either, and a comprehension of ``Send``
+    objects used for parallel fan-out. Anything else yields no name and reports ``False`` so the
+    caller can mark the node ``partial`` rather than pretend the node does not route there.
+    """
+    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+        return [value.value], True
+
+    if isinstance(value, ast.Name):
+        if value.id in start_names:
+            return [START_SENTINEL], True
+        if value.id in end_names:
+            return [END_SENTINEL], True
+        return [], False  # a variable holding a destination — never traced (DEC-007's rule)
+
+    if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+        names: list[str] = []
+        ok = True
+        for element in value.elts:
+            sub, sub_ok = _resolve_goto_targets(element, start_names, end_names, send_names)
+            names.extend(sub)
+            ok = ok and sub_ok
+        return names, ok
+
+    if isinstance(value, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+        # Parallel fan-out: `goto=[Send("worker", ...) for s in items]`. Every element targets the
+        # same node, so the comprehension contributes exactly that one destination.
+        return _resolve_goto_targets(value.elt, start_names, end_names, send_names)
+
+    if isinstance(value, ast.Call):
+        if _is_named_call(value.func, send_names) and value.args:
+            first = value.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                return [first.value], True
+        return [], False
+
+    return [], False
+
+
+def _is_named_call(func: ast.AST, names: set[str]) -> bool:
+    """True when a call's callee is one of ``names``, plain or attribute-qualified."""
+    if isinstance(func, ast.Name):
+        return func.id in names
+    if isinstance(func, ast.Attribute):
+        return func.attr in names
+    return False
+
+
+def build_routing_edges(
+    graph_id: str, node_name: str, destinations: list[str]
+) -> tuple[list[EdgeDef], list[ConditionalRoute]]:
+    """Turn one node's ``Command(goto=...)`` destinations into edges and routes (DEC-020).
+
+    Shared by both resolution sites so same-file and cross-file routing produce identical output.
+
+    A single destination is an unconditional hand-off and becomes one normal edge. Two or more
+    means the function itself branches, so each becomes a conditional edge naming that function as
+    the router, mirrored by a ``ConditionalRoute``. Those routes never carry a ``condition_value``:
+    the source states where it may route, never what value triggers it, so per DEC-017 the value is
+    absent and the certainty is recorded as ``not_derivable`` instead of being invented.
+    """
+    if not destinations:
+        return [], []
+
+    source_id = make_node_id(graph_id, node_name)
+    if len(destinations) == 1:
+        target = destinations[0]
+        edge_id = make_edge_id(graph_id, node_name, target, EDGE_NORMAL)
+        return [
+            EdgeDef(
+                id=edge_id,
+                graph_id=graph_id,
+                source_node_id=source_id,
+                target_node_id=make_node_id(graph_id, target),
+                type=EDGE_NORMAL,
+                condition_function_name=None,
+            )
+        ], []
+
+    edges: list[EdgeDef] = []
+    routes: list[ConditionalRoute] = []
+    for target in destinations:
+        edge_id = make_edge_id(graph_id, node_name, target, EDGE_CONDITIONAL, target)
+        edges.append(
+            EdgeDef(
+                id=edge_id,
+                graph_id=graph_id,
+                source_node_id=source_id,
+                target_node_id=make_node_id(graph_id, target),
+                type=EDGE_CONDITIONAL,
+                condition_function_name=node_name,
+            )
+        )
+        routes.append(
+            ConditionalRoute(
+                id=make_route_id(edge_id),
+                edge_id=edge_id,
+                condition_value=None,
+                target_node_id=make_node_id(graph_id, target),
+                value_resolution=CONDITION_VALUE_NOT_DERIVABLE,
+            )
+        )
+    return edges, routes
+
+
 def extract_tools_from_funcdef(
     node_id: str, funcdef: ast.AST, module_tree: ast.AST
 ) -> tuple[list[ToolBinding], str]:

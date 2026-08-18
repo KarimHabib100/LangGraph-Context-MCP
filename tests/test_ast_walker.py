@@ -23,6 +23,9 @@ from langgraph_context_mcp.parser.graph_model import (
     RESOLUTION_FULL,
     RESOLUTION_NOT_APPLICABLE,
     RESOLUTION_PARTIAL,
+    ROUTING_RESOLUTION_FULL,
+    ROUTING_RESOLUTION_NOT_APPLICABLE,
+    ROUTING_RESOLUTION_PARTIAL,
     TOOL_RESOLUTION_FULL,
     TOOL_RESOLUTION_NOT_APPLICABLE,
     TOOL_RESOLUTION_PARTIAL,
@@ -68,6 +71,7 @@ def test_simple_fixture_identifies_all_nodes_edges_and_conditionals():
     assert _node_names(graph) == {
         "check_auth_token",
         "fetch_data",
+        "enrich_data",
         "format_response",
         "handle_error",
     }
@@ -84,10 +88,16 @@ def test_simple_fixture_identifies_all_nodes_edges_and_conditionals():
     normal = [e for e in graph.edges if e.type == EDGE_NORMAL]
     conditional = [e for e in graph.edges if e.type == EDGE_CONDITIONAL]
     assert len(normal) == 3
-    assert len(conditional) == 2
+    # 2 from add_conditional_edges + 3 from enrich_data's Command(goto=...) branches, which
+    # name the node function itself as the router (DEC-020).
+    assert len(conditional) == 5
+    assert {e.condition_function_name for e in conditional} == {
+        "route_after_auth",
+        "enrich_data",
+    }
 
-    # The conditional edge routes to two distinct destinations via route_after_auth.
-    assert {e.condition_function_name for e in conditional} == {"route_after_auth"}
+    # The builder-declared conditional edge routes to two distinct destinations via
+    # route_after_auth, and its dict-literal mapping still yields real condition values.
     route_targets = {r.condition_value: r.target_node_id for r in graph.conditional_routes}
     assert route_targets["authorized"] == make_node_id(graph.id, "fetch_data")
     assert route_targets["unauthorized"] == make_node_id(graph.id, "handle_error")
@@ -1081,3 +1091,326 @@ def test_derivation_is_independent_of_call_order(tmp_path: Path):
     )
 
     assert before == after == "alpha"
+
+
+# --------------------------------------------------------------------------------------------
+# DEC-020 — Command(goto=...) routing declared in a node function body (QA-5-03 / RISK-011)
+# --------------------------------------------------------------------------------------------
+_COMMAND_HEADER = """from langgraph.graph import StateGraph, START, END
+from langgraph.types import Command, Send
+from typing import Literal
+"""
+
+
+def test_command_goto_literal_becomes_a_normal_edge(tmp_path: Path):
+    """A single `return Command(goto="x")` is an unconditional hand-off, so one normal edge."""
+    src = _COMMAND_HEADER + '''
+def plan(state) -> Command[Literal["execute"]]:
+    """Decide the plan."""
+    return Command(goto="execute", update={"plan": 1})
+
+def execute(state):
+    return state
+
+g = StateGraph(dict)
+g.add_node("plan", plan)
+g.add_node("execute", execute)
+g.add_edge(START, "plan")
+g.add_edge("execute", END)
+'''
+    path = _write(tmp_path, "literal_goto.py", src)
+    graph = find_graph_definitions(path)[0]
+
+    edge = next(
+        e
+        for e in graph.edges
+        if e.source_node_id.endswith("::plan") and e.target_node_id.endswith("::execute")
+    )
+    assert edge.type == EDGE_NORMAL
+    assert edge.condition_function_name is None
+
+    plan = next(n for n in graph.nodes if n.name == "plan")
+    assert plan.resolution == RESOLUTION_FULL
+    assert plan.routing_resolution == ROUTING_RESOLUTION_FULL
+
+
+def test_command_goto_branching_becomes_conditional_edges_with_no_invented_value(tmp_path: Path):
+    """Several goto targets from different branches: one conditional edge each.
+
+    The node function is itself the router, and no `condition_value` may be invented — the
+    source says where it can go, never what return value triggers it (DEC-017's rule).
+    """
+    src = _COMMAND_HEADER + '''
+def triage(state) -> Command[Literal["urgent", "normal", "__end__"]]:
+    """Route by severity."""
+    if state["sev"] > 8:
+        return Command(goto="urgent")
+    if state["sev"] > 3:
+        return Command(goto="normal")
+    return Command(goto=END)
+
+def urgent(state):
+    return state
+
+def normal(state):
+    return state
+
+g = StateGraph(dict)
+g.add_node("triage", triage)
+g.add_node("urgent", urgent)
+g.add_node("normal", normal)
+g.add_edge(START, "triage")
+'''
+    path = _write(tmp_path, "branching_goto.py", src)
+    graph = find_graph_definitions(path)[0]
+
+    from_triage = [e for e in graph.edges if e.source_node_id.endswith("::triage")]
+    targets = {e.target_node_id.rsplit("::", 1)[-1] for e in from_triage}
+    assert targets == {"urgent", "normal", END_SENTINEL}
+    assert all(e.type == EDGE_CONDITIONAL for e in from_triage)
+    assert all(e.condition_function_name == "triage" for e in from_triage)
+
+    routes = [
+        r for r in graph.conditional_routes if r.edge_id in {e.id for e in from_triage}
+    ]
+    assert len(routes) == 3
+    assert all(r.condition_value is None for r in routes)
+    assert all(r.value_resolution == CONDITION_VALUE_NOT_DERIVABLE for r in routes)
+
+    triage = next(n for n in graph.nodes if n.name == "triage")
+    assert triage.routing_resolution == ROUTING_RESOLUTION_FULL
+
+
+def test_command_goto_non_literal_is_disclosed_not_dropped(tmp_path: Path):
+    """A computed goto yields no edge and marks routing partial — never a silent 'no routing'.
+
+    This is the honesty requirement: an unknown must not look identical to a verified fact.
+    `resolution` stays FULL because the *function* was located; only the routing axis degrades.
+    """
+    src = _COMMAND_HEADER + '''
+def dispatch(state):
+    """Route to a computed destination."""
+    target = state["next_step"]
+    return Command(goto=target)
+
+g = StateGraph(dict)
+g.add_node("dispatch", dispatch)
+g.add_edge(START, "dispatch")
+'''
+    path = _write(tmp_path, "dynamic_goto.py", src)
+    graph = find_graph_definitions(path)[0]
+
+    dispatch = next(n for n in graph.nodes if n.name == "dispatch")
+    assert dispatch.resolution == RESOLUTION_FULL, "the function itself was located"
+    assert dispatch.routing_resolution == ROUTING_RESOLUTION_PARTIAL
+    assert not [e for e in graph.edges if e.source_node_id.endswith("::dispatch")], (
+        "an unresolvable destination must not be fabricated into an edge"
+    )
+
+
+def test_command_goto_mixed_literal_and_variable_keeps_the_known_half(tmp_path: Path):
+    """One resolvable branch and one not: keep the real edge, still flag the node partial."""
+    src = _COMMAND_HEADER + '''
+def partly(state):
+    """Half-knowable routing."""
+    if state["done"]:
+        return Command(goto="finish")
+    return Command(goto=state["fallback"])
+
+def finish(state):
+    return state
+
+g = StateGraph(dict)
+g.add_node("partly", partly)
+g.add_node("finish", finish)
+'''
+    path = _write(tmp_path, "mixed_goto.py", src)
+    graph = find_graph_definitions(path)[0]
+
+    targets = {
+        e.target_node_id.rsplit("::", 1)[-1]
+        for e in graph.edges
+        if e.source_node_id.endswith("::partly")
+    }
+    assert targets == {"finish"}
+    node = next(n for n in graph.nodes if n.name == "partly")
+    assert node.routing_resolution == ROUTING_RESOLUTION_PARTIAL
+
+
+def test_command_goto_send_fanout_resolves_to_the_send_destination(tmp_path: Path):
+    """`goto=[Send("worker", ...) for ...]` is parallel fan-out at one known destination."""
+    src = _COMMAND_HEADER + '''
+def spread(state):
+    """Fan out to workers."""
+    return Command(goto=[Send("worker", {"item": i}) for i in state["items"]])
+
+def worker(state):
+    return state
+
+g = StateGraph(dict)
+g.add_node("spread", spread)
+g.add_node("worker", worker)
+'''
+    path = _write(tmp_path, "fanout_goto.py", src)
+    graph = find_graph_definitions(path)[0]
+
+    edge = next(e for e in graph.edges if e.source_node_id.endswith("::spread"))
+    assert edge.target_node_id.endswith("::worker")
+    assert edge.type == EDGE_NORMAL  # one distinct destination
+    node = next(n for n in graph.nodes if n.name == "spread")
+    assert node.routing_resolution == ROUTING_RESOLUTION_FULL
+
+
+def test_node_without_command_reports_routing_not_applicable(tmp_path: Path):
+    """A body that was read and contains no Command(goto=...) is not_applicable, not partial."""
+    src = _COMMAND_HEADER + '''
+def plain(state):
+    """No routing of its own."""
+    return {"x": 1}
+
+g = StateGraph(dict)
+g.add_node("plain", plain)
+g.add_edge(START, "plain")
+g.add_edge("plain", END)
+'''
+    path = _write(tmp_path, "plain_node.py", src)
+    graph = find_graph_definitions(path)[0]
+    node = next(n for n in graph.nodes if n.name == "plain")
+    assert node.routing_resolution == ROUTING_RESOLUTION_NOT_APPLICABLE
+
+
+def test_unresolved_node_reports_routing_partial_not_a_false_negative(tmp_path: Path):
+    """If the body was never located, routing state is an honest unknown.
+
+    This is the shape that produced QA-5-03: `research_supervisor` is a compiled subgraph whose
+    body we cannot read, and reporting "does not route" for it would be a guess.
+    """
+    src = _COMMAND_HEADER + '''
+from .elsewhere import make_stage
+
+g = StateGraph(dict)
+g.add_node("stage", make_stage("a"))
+'''
+    path = _write(tmp_path, "unresolved_node.py", src)
+    graph = find_graph_definitions(path)[0]
+    node = next(n for n in graph.nodes if n.name == "stage")
+    assert node.resolution == RESOLUTION_PARTIAL
+    assert node.routing_resolution == ROUTING_RESOLUTION_PARTIAL
+
+
+def test_command_resume_without_goto_is_not_routing(tmp_path: Path):
+    """`Command(resume=True)` expresses resumption, not routing — it must create no edge."""
+    src = _COMMAND_HEADER + '''
+def gate(state):
+    """Human-in-the-loop gate."""
+    return Command(resume=True)
+
+g = StateGraph(dict)
+g.add_node("gate", gate)
+g.add_edge(START, "gate")
+'''
+    path = _write(tmp_path, "resume_only.py", src)
+    graph = find_graph_definitions(path)[0]
+    node = next(n for n in graph.nodes if n.name == "gate")
+    assert node.routing_resolution == ROUTING_RESOLUTION_NOT_APPLICABLE
+    assert not [e for e in graph.edges if e.source_node_id.endswith("::gate")]
+
+
+def test_command_edge_does_not_duplicate_an_already_declared_edge(tmp_path: Path):
+    """A goto restating an add_edge-declared edge collapses onto the same deterministic ID."""
+    src = _COMMAND_HEADER + '''
+def a(state):
+    """Routes onward."""
+    return Command(goto="b")
+
+def b(state):
+    return state
+
+g = StateGraph(dict)
+g.add_node("a", a)
+g.add_node("b", b)
+g.add_edge("a", "b")
+'''
+    path = _write(tmp_path, "dupe_edge.py", src)
+    graph = find_graph_definitions(path)[0]
+    a_to_b = [
+        e
+        for e in graph.edges
+        if e.source_node_id.endswith("::a") and e.target_node_id.endswith("::b")
+    ]
+    assert len(a_to_b) == 1
+
+
+def test_cross_file_command_routing_is_detected(tmp_path: Path):
+    """Routing declared in a node function that lives in another module still yields edges."""
+    _write(
+        tmp_path,
+        "stages.py",
+        '''from langgraph.types import Command
+from typing import Literal
+
+
+def review(state) -> Command[Literal["approve", "reject"]]:
+    """Route by score."""
+    if state["score"] > 5:
+        return Command(goto="approve")
+    return Command(goto="reject")
+''',
+    )
+    _write(
+        tmp_path,
+        "app.py",
+        """from langgraph.graph import StateGraph, START
+from stages import review
+
+
+def approve(state):
+    return state
+
+
+def reject(state):
+    return state
+
+
+g = StateGraph(dict)
+g.add_node("review", review)
+g.add_node("approve", approve)
+g.add_node("reject", reject)
+g.add_edge(START, "review")
+""",
+    )
+    graphs = scan_repository(tmp_path)
+    graph = next(g for g in graphs if g.variable_name == "g")
+
+    review = next(n for n in graph.nodes if n.name == "review")
+    assert review.resolution == RESOLUTION_FULL
+    assert review.routing_resolution == ROUTING_RESOLUTION_FULL
+
+    targets = {
+        e.target_node_id.rsplit("::", 1)[-1]
+        for e in graph.edges
+        if e.source_node_id.endswith("::review")
+    }
+    assert targets == {"approve", "reject"}
+
+
+def test_command_goto_end_uses_the_sentinel_under_an_alias(tmp_path: Path):
+    """`goto=END` must resolve to the same sentinel `add_edge(x, END)` produces, alias included."""
+    src = '''from langgraph.graph import StateGraph, START
+from langgraph.graph import END as FINISH
+from langgraph.types import Command
+
+
+def stop(state):
+    """Ends the run."""
+    return Command(goto=FINISH)
+
+
+g = StateGraph(dict)
+g.add_node("stop", stop)
+g.add_edge(START, "stop")
+'''
+    path = _write(tmp_path, "aliased_end.py", src)
+    graph = find_graph_definitions(path)[0]
+    edge = next(e for e in graph.edges if e.source_node_id.endswith("::stop"))
+    assert edge.target_node_id == make_node_id(graph.id, END_SENTINEL)

@@ -147,7 +147,7 @@ def test_index_repo_returns_the_prd_contract_shape(fixture_repo):
         "duration_ms",
     }
     assert result["graphs_found"] == 1
-    assert result["nodes_indexed"] == 4
+    assert result["nodes_indexed"] == 5
     assert result["backend"] == "sqlite"
 
 
@@ -246,11 +246,12 @@ def test_get_graph_summary_returns_contract_keys_and_node_names(indexed_repo):
     graph = summary["graphs"][0]
     assert graph["variable_name"] == "graph"
     assert graph["entry_point"] == "check_auth_token"
-    assert graph["node_count"] == 4
-    assert graph["edge_count"] == 5
+    assert graph["node_count"] == 5
+    assert graph["edge_count"] == 8
     assert graph["nodes"] == [
         "check_auth_token",
         "fetch_data",
+        "enrich_data",
         "format_response",
         "handle_error",
     ]
@@ -313,7 +314,14 @@ def test_trace_path_returns_the_route(indexed_repo):
     result = trace_path("check_auth_token", "format_response", str(indexed_repo))
 
     assert result["path_found"] is True
-    assert result["route"] == ["check_auth_token", "fetch_data", "format_response"]
+    # Passes through enrich_data, whose onward routing is declared by Command(goto=...) in
+    # its body rather than by a builder call — so this route only resolves under DEC-020.
+    assert result["route"] == [
+        "check_auth_token",
+        "fetch_data",
+        "enrich_data",
+        "format_response",
+    ]
 
 
 def test_trace_path_reports_the_conditional_branch_it_crossed(indexed_repo):
@@ -533,7 +541,7 @@ def test_repository_status_before_and_after_indexing(fixture_repo):
 
     assert after["indexed"] is True
     assert after["graph_count"] == 1
-    assert after["node_count"] == 4
+    assert after["node_count"] == 5
     assert after["backend"] == "sqlite"
     assert after["last_indexed_at"]
 

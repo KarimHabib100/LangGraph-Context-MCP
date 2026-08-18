@@ -26,6 +26,10 @@ from langgraph_context_mcp.indexer import (
     index_repository,
     plan_embedding_batches,
 )
+from langgraph_context_mcp.parser.graph_model import (
+    CONDITION_VALUE_KNOWN,
+    CONDITION_VALUE_NOT_DERIVABLE,
+)
 from langgraph_context_mcp.storage.base import make_repo_id
 from langgraph_context_mcp.storage.sqlite_store import SqliteStore, default_index_path
 
@@ -40,8 +44,8 @@ def test_indexes_the_fixture_repo_end_to_end(
     result = index_repository(fixture_repo, store=sqlite_store, embedder=fake_embedder)
 
     assert result.graphs_found == 1
-    assert result.nodes_indexed == 4
-    assert result.edges_indexed == 5
+    assert result.nodes_indexed == 5
+    assert result.edges_indexed == 8
     assert result.partial_nodes == 0
     assert result.backend == "sqlite"
     assert result.duration_ms >= 0
@@ -63,14 +67,15 @@ def test_indexed_nodes_are_searchable(
 
     results = sqlite_store.search(
         fake_embedder.embed(["fetch the requested data"])[0],
-        top_k=4,
+        top_k=5,
         filters={"repo_id": repo_id},
     )
 
-    assert len(results) == 4
+    assert len(results) == 5
     assert {result.node_name for result in results} == {
         "check_auth_token",
         "fetch_data",
+        "enrich_data",
         "format_response",
         "handle_error",
     }
@@ -92,12 +97,21 @@ def test_graph_structure_is_persisted(
     assert {node.name for node in graph.nodes} == {
         "check_auth_token",
         "fetch_data",
+        "enrich_data",
         "format_response",
         "handle_error",
     }
+    # Both route flavours survive the storage round-trip: the dict-form ones carry a real
+    # condition value (DEC-017 "known"), while enrich_data's Command branches carry None
+    # because the source never states what triggers them (DEC-020 "not_derivable").
     assert {route.condition_value for route in graph.conditional_routes} == {
         "authorized",
         "unauthorized",
+        None,
+    }
+    assert {route.value_resolution for route in graph.conditional_routes} == {
+        CONDITION_VALUE_KNOWN,
+        CONDITION_VALUE_NOT_DERIVABLE,
     }
     assert sqlite_store.get_graph(graph.id) == graph
 
@@ -114,8 +128,8 @@ def test_embedding_is_issued_in_bounded_batches(
 
     # Every chunk is embedded exactly once, across however many calls the budget produced.
     embedded = [text for call in fake_embedder.embed_calls for text in call]
-    assert len(embedded) == 4
-    assert len(set(embedded)) == 4
+    assert len(embedded) == 5
+    assert len(set(embedded)) == 5
 
     for call in fake_embedder.embed_calls:
         padded_volume = len(call) * max(len(text) for text in call)
@@ -135,7 +149,7 @@ def test_reindexing_is_idempotent(
     results = sqlite_store.search(
         fake_embedder.embed(["anything"])[0], top_k=50, filters={"repo_id": repo_id}
     )
-    assert len(results) == 4
+    assert len(results) == 5
 
 
 def test_reindexing_drops_nodes_that_no_longer_exist(
@@ -157,7 +171,7 @@ def test_reindexing_drops_nodes_that_no_longer_exist(
         fake_embedder.embed(["anything"])[0], top_k=50, filters={"repo_id": repo_id}
     )
     assert "handle_error" not in {result.node_name for result in results}
-    assert len(results) == 3
+    assert len(results) == 4
 
 
 def test_zero_config_run_creates_the_index_under_the_repo(
@@ -201,7 +215,7 @@ def test_syntax_error_file_does_not_stop_the_scan(
     result = index_repository(fixture_repo, store=sqlite_store, embedder=fake_embedder)
 
     assert result.graphs_found == 1
-    assert result.nodes_indexed == 4
+    assert result.nodes_indexed == 5
 
 
 def test_missing_path_raises_file_not_found(

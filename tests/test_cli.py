@@ -43,7 +43,7 @@ def test_index_exits_0_when_graphs_are_found(fixture_repo, capsys):
 
     assert code == EXIT_OK
     out = capsys.readouterr().out
-    assert "1 graph(s), 4 node(s), 5 edge(s)" in out
+    assert "1 graph(s), 5 node(s), 8 edge(s)" in out
 
 
 def test_index_exits_1_when_no_graphs_are_found(empty_repo, capsys):
@@ -125,7 +125,7 @@ def test_status_exits_0_after_indexing(fixture_repo, capsys):
     assert code == EXIT_OK
     out = capsys.readouterr().out
     assert "Index found" in out
-    assert "1 graph(s), 4 node(s)" in out
+    assert "1 graph(s), 5 node(s)" in out
     assert "sqlite" in out
 
 
@@ -184,7 +184,7 @@ def test_status_json_reports_the_structured_status(fixture_repo, capsys):
     assert code == EXIT_OK
     assert payload["indexed"] is True
     assert payload["graph_count"] == 1
-    assert payload["node_count"] == 4
+    assert payload["node_count"] == 5
     assert payload["backend"] == "sqlite"
 
 

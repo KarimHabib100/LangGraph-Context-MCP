@@ -190,10 +190,11 @@ def test_normal_scan_still_works(fixture_repo: Path) -> None:
     graphs = scan_repository(fixture_repo)
 
     assert len(graphs) == 1
-    assert len(graphs[0].nodes) == 4
+    assert len(graphs[0].nodes) == 5
     assert {node.name for node in graphs[0].nodes} == {
         "fetch_data",
         "check_auth_token",
+        "enrich_data",
         "handle_error",
         "format_response",
     }
