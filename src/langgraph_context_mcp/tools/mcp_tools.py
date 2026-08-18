@@ -41,12 +41,19 @@ from ..graph_queries import (
     find_node,
     find_route,
     has_conditional_edge,
+    node_routing_resolution,
     nodes_with_unenumerated_tools,
+    nodes_with_unresolved_routing,
     summarize_graph,
     tool_callers,
 )
 from ..indexer import index_repository
-from ..parser.graph_model import END_SENTINEL, START_SENTINEL, GraphDef
+from ..parser.graph_model import (
+    END_SENTINEL,
+    ROUTING_RESOLUTION_PARTIAL,
+    START_SENTINEL,
+    GraphDef,
+)
 from ..parser.repo_scanner import resolve_repo_root
 from ..storage.base import make_repo_id
 from ..storage.factory import open_existing_store
@@ -64,6 +71,9 @@ ERROR_EMPTY_TOOL_NAME = "empty_tool_name"
 ERROR_INVALID_TOP_K = "invalid_top_k"
 ERROR_UNKNOWN_NODE = "unknown_node"
 ERROR_NOT_CONDITIONAL = "not_conditional"
+# Distinct from not_conditional on purpose: "we could not tell" must never be reported as
+# "we checked and it does not branch" (RISK-012, DEC-021).
+ERROR_ROUTING_NOT_RESOLVABLE = "routing_not_resolvable"
 ERROR_INTERNAL = "internal_error"
 
 INDEX_FIRST = "call index_repo first"
@@ -348,8 +358,12 @@ def trace_path(from_node: str, to_node: str, path: str) -> dict:
         `{path_found: true, graph_id, route: [node_name, ...], conditional_branches: [...]}` when a
         route exists. `route` includes both endpoints. Each conditional branch is
         `{source, target, condition_function, condition_value, value_resolution}`.
-        `{path_found: false, detail}` is a real answer meaning no directed path exists — not an
-        error. Only *one* shortest route is returned; other routes may also exist.
+        `{path_found: false, detail, unresolved_routing_nodes}` is a real answer meaning no
+        statically declared path exists — not an error. Only *one* shortest route is returned;
+        other routes may also exist. When `unresolved_routing_nodes` is non-empty, those nodes'
+        own routing could not be enumerated, so a path may exist through routing static analysis
+        cannot see: report the absence as "no declared path found", not as "these nodes are not
+        connected".
         When `value_resolution` is `"not_derivable"`, `condition_value` is null: the source listed
         destinations without stating what the router returns. Say "routes to X", never "returns 'X'".
         On failure: `{error: "unknown_node", node, valid_nodes}` when a name is not in the graph,
@@ -390,14 +404,33 @@ def trace_path(from_node: str, to_node: str, path: str) -> dict:
             ],
         }
 
+    # A "no path" answer is only trustworthy if every node's routing was actually enumerable. Any
+    # node with unresolved routing may route somewhere we never saw, so it is disclosed alongside
+    # the negative rather than left to make the answer look more certain than it is (DEC-021).
+    relevant = [graph for graph in graphs if find_node([graph], from_node) is not None] or graphs
+    unresolved = [
+        {"node_name": node.name, "file_path": graph.file_path}
+        for graph, node in nodes_with_unresolved_routing(relevant)
+    ]
+    if unresolved:
+        detail = (
+            f"No statically declared path from {from_node!r} to {to_node!r}. Both names exist, but "
+            f"no parsed edge connects them in that direction — and this graph contains "
+            f"{len(unresolved)} node(s) whose own routing could not be enumerated, so a path may "
+            f"exist through routing that is not visible to static analysis. See "
+            f"unresolved_routing_nodes."
+        )
+    else:
+        detail = (
+            f"No directed path from {from_node!r} to {to_node!r}. Both names exist, but no graph "
+            f"in this repository connects them in that direction."
+        )
     return {
         "path_found": False,
         "route": [],
         "conditional_branches": [],
-        "detail": (
-            f"No directed path from {from_node!r} to {to_node!r}. Both names exist, but no graph "
-            f"in this repository connects them in that direction."
-        ),
+        "unresolved_routing_nodes": unresolved,
+        "detail": detail,
     }
 
 
@@ -480,8 +513,14 @@ def explain_conditional(edge_source: str, path: str) -> dict:
         means `condition_value` is null because the source only listed destinations without saying
         what the router returns — often it returns `Send` objects, not names. In that case say
         "routes to Y" and do not state or invent a trigger value.
-        On failure: `{error: "not_conditional", node}` when the node exists but has no conditional
-        edge, `{error: "unknown_node", node, valid_nodes}` when the name is not in the graph, or the
+        On failure: `{error: "not_conditional", node}` when the node exists, its body was read,
+        and it genuinely has no conditional edge.
+        `{error: "routing_not_resolvable", node, resolution, routing_resolution, reason}` when the
+        node has no conditional edge but its routing could not be enumerated — its function was not
+        located, or it returns `Command(goto=...)` with a computed destination. These two are
+        deliberately different: the first means "checked, it does not branch", the second means
+        "could not check". Never report the second as though the node has no conditional routing.
+        `{error: "unknown_node", node, valid_nodes}` when the name is not in the graph, or the
         usual path/index errors.
     """
     repo_root, error = _resolve_repo(path)
@@ -518,6 +557,26 @@ def explain_conditional(edge_source: str, path: str) -> dict:
                 "returned value."
             )
         return payload
+
+    # No conditional edge was found. Before saying so, check whether we were ever in a position to
+    # know: a node whose routing could not be enumerated may route somewhere we never saw, and
+    # answering `not_conditional` there asserts a fact about a body nobody read (RISK-012, DEC-021).
+    for graph in graphs:
+        routing = node_routing_resolution(graph, edge_source)
+        if routing == ROUTING_RESOLUTION_PARTIAL:
+            found = find_node(graphs, edge_source)
+            return {
+                "error": ERROR_ROUTING_NOT_RESOLVABLE,
+                "node": edge_source,
+                "resolution": found[1].resolution if found else None,
+                "routing_resolution": routing,
+                "reason": (
+                    "This node's routing could not be enumerated statically, so whether it "
+                    "branches is unknown rather than known to be false. Either its function was "
+                    "not located, or it returns Command(goto=...) with a computed destination. "
+                    "Do not report this node as having no conditional routing."
+                ),
+            }
 
     return {"error": ERROR_NOT_CONDITIONAL, "node": edge_source}
 

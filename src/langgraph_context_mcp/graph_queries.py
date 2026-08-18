@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from .parser.graph_model import (
     CONDITION_VALUE_NOT_DERIVABLE,
     EDGE_CONDITIONAL,
+    ROUTING_RESOLUTION_PARTIAL,
     TOOL_RESOLUTION_PARTIAL,
     ConditionalRoute,
     EdgeDef,
@@ -233,6 +234,31 @@ def nodes_with_unenumerated_tools(graphs: list[GraphDef]) -> list[tuple[GraphDef
         for node in graph.nodes
         if node.tool_resolution == TOOL_RESOLUTION_PARTIAL
     ]
+
+
+def nodes_with_unresolved_routing(graphs: list[GraphDef]) -> list[tuple[GraphDef, NodeDef]]:
+    """Nodes whose own routing could not be enumerated (``routing_resolution="partial"``).
+
+    The routing counterpart of ``nodes_with_unenumerated_tools``, and the honest caveat on any
+    "no path" or "not conditional" answer: such a node may route somewhere we could not see,
+    either because its body was never located or because a ``Command(goto=...)`` target is
+    computed (DEC-020). Without this, "we could not look" is indistinguishable from "we looked
+    and there is nothing" — see RISK-012.
+    """
+    return [
+        (graph, node)
+        for graph in graphs
+        for node in graph.nodes
+        if node.routing_resolution == ROUTING_RESOLUTION_PARTIAL
+    ]
+
+
+def node_routing_resolution(graph: GraphDef, node_name: str) -> str | None:
+    """The ``routing_resolution`` of one named node, or ``None`` when it is not in this graph."""
+    for node in graph.nodes:
+        if node.name == node_name:
+            return node.routing_resolution
+    return None
 
 
 def summarize_graph(graph: GraphDef) -> dict:

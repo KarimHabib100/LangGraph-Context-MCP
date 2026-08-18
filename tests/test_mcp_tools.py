@@ -553,3 +553,104 @@ def test_repository_status_reports_a_bad_path_as_an_error(tmp_path):
 def test_repository_status_is_not_registered_as_a_tool():
     """DEC-004 fixes the surface at seven."""
     assert repository_status not in TOOL_FUNCTIONS
+
+
+# --------------------------------------------------------------------------------------------
+# DEC-021 / RISK-012 — routing uncertainty must be visible at the tool boundary
+# --------------------------------------------------------------------------------------------
+UNRESOLVED_ROUTING_GRAPH = '''from langgraph.graph import StateGraph, START, END
+from langgraph.types import Command
+
+from .elsewhere import build_router
+
+
+def settle(state):
+    """A plain node whose body was read and genuinely does not branch."""
+    return {"done": True}
+
+
+def dispatch(state):
+    """Routes to a computed destination, so its targets cannot be enumerated."""
+    return Command(goto=state["next_step"])
+
+
+g = StateGraph(dict)
+g.add_node("mystery", build_router("x"))     # function never located -> routing unknown
+g.add_node("dispatch", dispatch)             # located, but goto is computed -> routing unknown
+g.add_node("settle", settle)                 # located, no Command at all -> genuinely plain
+g.add_edge(START, "mystery")
+g.add_edge("settle", END)
+'''
+
+
+@pytest.fixture
+def unresolved_routing_repo(tmp_path):
+    """A repo holding all three routing states side by side, so they can be compared."""
+    repo = tmp_path / "unresolved_routing"
+    repo.mkdir()
+    (repo / "agent.py").write_text(UNRESOLVED_ROUTING_GRAPH, encoding="utf-8")
+    index_repo(str(repo))
+    return repo
+
+
+def test_unresolved_routing_is_distinguishable_from_genuinely_not_conditional(
+    unresolved_routing_repo,
+):
+    """The whole point of RISK-012: these two must not return the same thing.
+
+    `settle` was read and has no conditional edge. `mystery` was never located, so whether it
+    branches is unknown. Before DEC-021 both returned a byte-identical `not_conditional`, which
+    told a client that an uninspected body had been checked.
+    """
+    plain = explain_conditional("settle", str(unresolved_routing_repo))
+    unknown = explain_conditional("mystery", str(unresolved_routing_repo))
+
+    assert plain["error"] == "not_conditional"
+    assert unknown["error"] == "routing_not_resolvable"
+    assert plain != unknown, "an unknown answer must not be identical to a settled one"
+
+
+def test_computed_goto_reports_routing_not_resolvable_although_the_body_was_read(
+    unresolved_routing_repo,
+):
+    """`dispatch` was located, so `resolution` is full — only its *routing* is unknown.
+
+    This is the case QA-5-03's fix created and RISK-012 left invisible: on real code
+    (`planner`, `worker_node` in the langgraph monorepo) the node genuinely does route
+    conditionally, and the old answer asserted it did not.
+    """
+    result = explain_conditional("dispatch", str(unresolved_routing_repo))
+
+    assert result["error"] == "routing_not_resolvable"
+    assert result["resolution"] == "full"
+    assert result["routing_resolution"] == "partial"
+    assert "computed" in result["reason"] or "not located" in result["reason"]
+
+
+def test_not_conditional_is_still_returned_for_a_node_that_was_actually_checked(
+    indexed_repo,
+):
+    """The fix must not make every negative uncertain — regression guard on the honest case."""
+    result = explain_conditional("fetch_data", str(indexed_repo))
+
+    assert result["error"] == "not_conditional"
+    assert "routing_resolution" not in result
+
+
+def test_trace_path_negative_answer_discloses_unresolved_routing(unresolved_routing_repo):
+    """A "no path" answer must say when it could not see all the routing."""
+    result = trace_path("mystery", "settle", str(unresolved_routing_repo))
+
+    assert result["path_found"] is False
+    names = {entry["node_name"] for entry in result["unresolved_routing_nodes"]}
+    assert {"mystery", "dispatch"} <= names
+    assert "statically declared" in result["detail"]
+
+
+def test_trace_path_negative_answer_stays_plain_when_all_routing_was_enumerated(indexed_repo):
+    """No false alarm: the fixture's routing is fully known, so nothing is disclosed."""
+    result = trace_path("handle_error", "fetch_data", str(indexed_repo))
+
+    assert result["path_found"] is False
+    assert result["unresolved_routing_nodes"] == []
+    assert "no graph" in result["detail"]
