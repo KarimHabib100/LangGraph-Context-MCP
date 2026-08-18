@@ -20,7 +20,7 @@ import pytest
 from support import FIXTURE_REPO, TEST_DIMENSION, FakeEmbeddingProvider
 
 from langgraph_context_mcp.storage.pgvector_store import PgvectorStore
-from langgraph_context_mcp.storage.sqlite_store import SqliteStore
+from langgraph_context_mcp.storage.sqlite_store import INDEX_DIR_NAME, SqliteStore
 
 
 @pytest.fixture
@@ -66,7 +66,16 @@ def fixture_repo(tmp_path: Path) -> Path:
 
     Copied rather than used in place so an index written to the default
     ``.langgraph-context/index.db`` location lands in ``tmp_path``, never in the source tree.
+
+    An existing index directory is excluded from the copy. Indexing the fixture *in place* — which
+    manual testing and several Phase 5 scenarios naturally do — leaves a real index in the source
+    tree; copying it would hand every test a pre-built index from a different embedding model, and
+    the suite fails with dimension mismatches that look exactly like a code regression. Ignoring it
+    here means the fixture is always a clean, unindexed repository no matter what was run against
+    the original.
     """
     destination = tmp_path / "sample_repo"
-    shutil.copytree(FIXTURE_REPO, destination)
+    shutil.copytree(
+        FIXTURE_REPO, destination, ignore=shutil.ignore_patterns(INDEX_DIR_NAME)
+    )
     return destination
