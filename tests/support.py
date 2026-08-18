@@ -189,3 +189,30 @@ def store_graph(
         dimension=dimension,
         indexed_at=datetime.now(UTC),
     )
+
+
+def configured_backend() -> str:
+    """The backend name the factory will actually choose, per DEC-002's rule.
+
+    Tests that assert on the reported backend must respect the ambient ``DATABASE_URL`` rather
+    than hardcoding ``"sqlite"``. CI sets that variable job-wide, so a hardcoded expectation
+    fails there while passing on a developer machine — which is exactly how QA-5-04 went
+    unnoticed from Phase 4 until Phase 5.
+    """
+    import os
+
+    return "pgvector" if (os.environ.get("DATABASE_URL") or "").strip() else "sqlite"
+
+
+def requires_sqlite_backend() -> None:
+    """Skip a test that is inherently SQLite-specific when Postgres is configured.
+
+    The same clean-skip convention ``conftest.pgvector_store`` uses in the other direction, so
+    backend-specific tests never silently assume the default.
+    """
+    import os
+
+    import pytest
+
+    if (os.environ.get("DATABASE_URL") or "").strip():
+        pytest.skip("DATABASE_URL is set — this test inspects the on-disk SQLite index file")

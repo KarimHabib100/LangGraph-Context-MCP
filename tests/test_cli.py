@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from support import FakeEmbeddingProvider
+from support import FakeEmbeddingProvider, configured_backend
 
 from langgraph_context_mcp.cli import EXIT_ERROR, EXIT_NEGATIVE, EXIT_OK, main
 from langgraph_context_mcp.tools import mcp_tools
@@ -126,7 +126,7 @@ def test_status_exits_0_after_indexing(fixture_repo, capsys):
     out = capsys.readouterr().out
     assert "Index found" in out
     assert "1 graph(s), 5 node(s)" in out
-    assert "sqlite" in out
+    assert configured_backend() in out
 
 
 def test_status_exits_2_when_the_path_does_not_exist(tmp_path, capsys):
@@ -185,7 +185,7 @@ def test_status_json_reports_the_structured_status(fixture_repo, capsys):
     assert payload["indexed"] is True
     assert payload["graph_count"] == 1
     assert payload["node_count"] == 5
-    assert payload["backend"] == "sqlite"
+    assert payload["backend"] == configured_backend()
 
 
 def test_status_json_when_not_indexed(fixture_repo, capsys):

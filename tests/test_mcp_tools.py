@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from support import FakeEmbeddingProvider
+from support import FakeEmbeddingProvider, configured_backend, requires_sqlite_backend
 
 from langgraph_context_mcp.server import TOOL_FUNCTIONS, build_server
 from langgraph_context_mcp.storage.sqlite_store import default_index_path
@@ -148,7 +148,7 @@ def test_index_repo_returns_the_prd_contract_shape(fixture_repo):
     }
     assert result["graphs_found"] == 1
     assert result["nodes_indexed"] == 5
-    assert result["backend"] == "sqlite"
+    assert result["backend"] == configured_backend()
 
 
 def test_index_repo_on_a_repo_without_langgraph_is_not_an_error(tmp_path):
@@ -472,6 +472,7 @@ def test_no_tool_raises_on_a_none_path(tool, args):
 
 def test_a_corrupt_index_is_reported_as_a_structured_error(indexed_repo):
     """QA-3-10: an opaque sqlite/vec0 exception must not cross the tool boundary."""
+    requires_sqlite_backend()  # corrupts the on-disk index file, which only SQLite has
     index_path = default_index_path(indexed_repo)
     index_path.write_bytes(b"SQLite format 3\x00" + b"garbage" * 200)
 
@@ -542,7 +543,7 @@ def test_repository_status_before_and_after_indexing(fixture_repo):
     assert after["indexed"] is True
     assert after["graph_count"] == 1
     assert after["node_count"] == 5
-    assert after["backend"] == "sqlite"
+    assert after["backend"] == configured_backend()
     assert after["last_indexed_at"]
 
 

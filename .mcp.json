@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "langgraph-context": {
-      "command": "uvx",
-      "args": ["--from", ".", "langgraph-context-mcp", "serve"]
+      "command": "C:\\Users\\itski\\Desktop\\LangGraph-Context-MCP\\.venv\\Scripts\\langgraph-context-mcp.exe",
+      "args": ["serve"]
     }
   }
 }

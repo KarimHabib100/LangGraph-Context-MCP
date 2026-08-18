@@ -1,17 +1,100 @@
+<div align="center">
+
 # LangGraph Context MCP
 
-**Status: In Development**
+**Ask your LangGraph codebase what it actually does — structurally, not by grepping.**
 
-LangGraph Context MCP is a Model Context Protocol server that parses a LangGraph Python
-codebase into a structural graph model (nodes, edges, conditional routing, tool bindings) and
-layers local semantic search on top of it, so AI coding assistants can answer questions about
-an agent's graph structure and logic without grepping or reading every file.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![Tests](https://img.shields.io/badge/tests-307-brightgreen.svg)](#status--limits)
+[![CI](https://github.com/KarimHabib100/LangGraph-Context-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/KarimHabib100/LangGraph-Context-MCP/actions/workflows/ci.yml)
+[![MCP](https://img.shields.io/badge/MCP-server-000000.svg)](https://modelcontextprotocol.io)
+
+</div>
+
+---
+
+LangGraph Context MCP is a Model Context Protocol server that parses a LangGraph Python codebase
+into a structural graph model — nodes, edges, conditional routing, tool bindings — and layers local
+semantic search on top, so an AI coding assistant can answer questions about your agent's
+architecture without reading every file.
+
+Structural answers come from parsing the actual graph definition, so they are exact rather than
+inferred. Everything runs locally: no API key, and no network access after the embedding model
+downloads once.
+
+```
+"how does execution get from clarify_with_user to the final report?"
+
+  clarify_with_user → write_research_brief → research_supervisor → final_report_generation
+  (branch at clarify_with_user, routed by the node itself)
+```
+
+## Requirements
+
+- **Python 3.11 or newer**
+- **[uv](https://docs.astral.sh/uv/getting-started/installation/)**, only if you use the `uv`
+  install path below. `pip` works without it.
+- Roughly **500 MB of disk** for the embedding model, downloaded once on first use.
+- No API key. No database server. No network access at query time.
 
 ## Install
 
+> **Not yet on PyPI.** The package name is registered as available but publication happens at
+> launch, so the two commands below are the correct forms and will work once it is published.
+> Until then, use the *from a local clone* option, which works today.
+
+Install it as a standalone command-line tool (recommended — keeps it out of your project's
+dependencies):
+
 ```bash
-uvx langgraph-context-mcp
+uv tool install langgraph-context-mcp
 ```
+
+Or install it into a Python environment with pip:
+
+```bash
+pip install langgraph-context-mcp
+```
+
+**From a local clone** (works today, before publication):
+
+```bash
+git clone https://github.com/KarimHabib100/LangGraph-Context-MCP.git
+cd LangGraph-Context-MCP
+uv tool install .          # or: pip install .
+```
+
+### Find where it was installed
+
+You will need the **absolute path** to the installed command for the MCP client configuration
+below, because desktop clients do not launch it through your shell. After installing:
+
+```bash
+# macOS / Linux
+which langgraph-context-mcp
+
+# Windows (PowerShell)
+Get-Command langgraph-context-mcp | Select-Object -ExpandProperty Source
+```
+
+`uv tool install` places it in `~/.local/bin` (Windows: `C:\Users\<you>\.local\bin`). uv will warn
+you if that directory is not on your `PATH`; `uv tool update-shell` adds it, and the tool still
+works by absolute path either way.
+
+## Quick start
+
+```bash
+cd my-langgraph-project
+langgraph-context-mcp index .
+```
+
+That scans the repository, embeds every graph node locally, and writes the index to
+`.langgraph-context/index.db`. Then point an MCP client at it — see
+[Connecting an MCP client](#connecting-an-mcp-client).
+
+The first run also downloads the embedding model, which takes a few minutes. Later runs are fast:
+a mid-sized repository indexes in roughly 20 seconds.
 
 ## CLI
 
@@ -25,15 +108,10 @@ langgraph-context-mcp status <path>    # report whether a path has an index
 
 ### `index <path>`
 
-Scans `<path>` for LangGraph graph definitions, builds one embedding per graph node, and writes
-the index to `<path>/.langgraph-context/index.db` (or to PostgreSQL — see
-[Storage backends](#storage-backends)). Re-running replaces that repository's previous index
-rather than appending to it.
-
-```bash
-cd my-langgraph-project
-langgraph-context-mcp index .
-```
+Scans `<path>` for LangGraph graph definitions, builds one embedding per graph node, and writes the
+index to `<path>/.langgraph-context/index.db` (or to PostgreSQL — see
+[Storage backends](#storage-backends)). Re-running replaces that repository's previous index rather
+than appending to it.
 
 ### `serve`
 
@@ -49,9 +127,9 @@ backend holds it. Read-only: it never creates an index.
 ### `--json`
 
 `index` and `status` accept `--json`, which prints the same structured result as machine-readable
-JSON instead of the human-readable summary. Exit codes are unaffected, so a script can read the
-code and the payload together. `serve` has no `--json` flag — extra output there would corrupt
-the MCP transport.
+JSON instead of the human-readable summary. Exit codes are unaffected, so a script can read the code
+and the payload together. `serve` has no `--json` flag — extra output there would corrupt the MCP
+transport.
 
 ```bash
 langgraph-context-mcp index . --json
@@ -67,8 +145,8 @@ Every subcommand uses the same three codes:
 | `1` | Ran correctly, but the answer is **negative** | `index` found no LangGraph usage in the path; `status` found no index |
 | `2` | **Could not run at all** | Path missing, not a directory, rejected by path validation, unreadable, or an unexpected failure |
 
-`1` is not an error. It exists so a script can tell "I asked, and the answer is no" apart from
-"I could not ask". A caller that does not need the distinction can test for `>= 2`:
+`1` is not an error. It exists so a script can tell "I asked, and the answer is no" apart from "I
+could not ask". A caller that does not need the distinction can test for `>= 2`:
 
 ```bash
 langgraph-context-mcp index . || [ $? -lt 2 ] || exit 1   # fail only on a real error
@@ -82,35 +160,140 @@ Paths containing `..` are rejected with exit `2`, as is an empty path. Pass an a
 
 ## Connecting an MCP client
 
-Point your client at `langgraph-context-mcp serve`. For Claude Code, a project-level `.mcp.json`:
+> **Use an absolute path to the command.** Desktop MCP clients spawn servers directly, without a
+> login shell, so they do not see the `PATH` your terminal sees. A bare `"command":
+> "langgraph-context-mcp"` or `"command": "uvx"` fails with `spawn ... ENOENT` /
+> `FileNotFoundError [WinError 2]` unless that directory happens to be on the *system* `PATH`.
+> Every example below uses an absolute path for that reason. Get yours with the
+> [`which` / `Get-Command`](#find-where-it-was-installed) commands above.
+
+Two forms work. The examples use the first:
+
+| Form | Use it when | Trade-off |
+|---|---|---|
+| **Installed console script** (absolute path) | Default. You ran `uv tool install` or `pip install` | Fastest startup — the server is already installed. You update it deliberately |
+| **`uvx` by absolute path** | You would rather not install anything permanently | No install step, and always the latest published version, but every launch resolves the environment first, so startup is slower. Requires the absolute path to `uvx` itself, not bare `uvx` |
+
+An absolute path is machine-specific, which is the cost of this approach: a config file committed to
+a shared repository will need each contributor to adjust the path, or to keep it in their own
+user-level client config instead.
+
+Index a repository first (`langgraph-context-mcp index /abs/path/to/repo`); the tools report
+`not_indexed` until you do, and the client can also call `index_repo` itself.
+
+### Claude Code
+
+A project-level `.mcp.json` in your repository root:
 
 ```json
 {
   "mcpServers": {
     "langgraph-context": {
-      "command": "uvx",
-      "args": ["--from", ".", "langgraph-context-mcp", "serve"]
+      "command": "/Users/you/.local/bin/langgraph-context-mcp",
+      "args": ["serve"]
     }
   }
 }
 ```
 
-For Claude Desktop, use the published package and an **absolute** path in the tool's arguments —
-the Desktop app does not launch the server from your project directory:
+On Windows, use the full executable path with escaped backslashes:
 
 ```json
 {
   "mcpServers": {
     "langgraph-context": {
-      "command": "uvx",
+      "command": "C:\\Users\\you\\.local\\bin\\langgraph-context-mcp.exe",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+### Claude Desktop
+
+Edit `claude_desktop_config.json` (Settings → Developer → Edit Config), using the same shape:
+
+```json
+{
+  "mcpServers": {
+    "langgraph-context": {
+      "command": "/Users/you/.local/bin/langgraph-context-mcp",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop, then confirm the server appears with its seven tools.
+
+<details>
+<summary>Alternative: <code>uvx</code> without installing</summary>
+
+Use the absolute path to `uvx`, not a bare `uvx`:
+
+```json
+{
+  "mcpServers": {
+    "langgraph-context": {
+      "command": "/Users/you/.local/bin/uvx",
       "args": ["langgraph-context-mcp", "serve"]
     }
   }
 }
 ```
 
-Index a repository first (`langgraph-context-mcp index /abs/path/to/repo`); the tools report
-`not_indexed` until you do, and the client can also call `index_repo` itself.
+</details>
+
+### Cursor
+
+Cursor uses the same `mcpServers` schema. Put it in `.cursor/mcp.json` for a single project, or
+`~/.cursor/mcp.json` to make it available everywhere:
+
+```json
+{
+  "mcpServers": {
+    "langgraph-context": {
+      "command": "/Users/you/.local/bin/langgraph-context-mcp",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+**MCP support is behind a settings toggle that can default to off.** If the server never appears,
+open Settings → MCP (or Settings → Tools & Integrations, depending on version), confirm MCP is
+enabled, and check that `langgraph-context` is toggled on in the server list.
+
+### Codex CLI / ChatGPT desktop
+
+> **Caveat, stated because the rest of this section is not hedged:** the Codex syntax below was
+> confirmed against current OpenAI documentation but **not run on the machine this README was
+> written on**, because the `codex` CLI is not installed there. Every other client configuration in
+> this README was actually spawned and verified. The launch command itself is the same verified
+> absolute-path form; what is unverified here is Codex's own `mcp add` flags, TOML shape, and config
+> file locations.
+
+Codex uses TOML, not JSON. The supported path is the CLI, which writes the config for you:
+
+```bash
+codex mcp add langgraph-context -- /Users/you/.local/bin/langgraph-context-mcp serve
+```
+
+Everything after `--` is the launch command. Then start a session and run `/mcp` to confirm the
+server connected and is listing its tools.
+
+This writes to `~/.codex/config.toml`, which the Codex CLI, the IDE extension, and the ChatGPT
+desktop app all share. Trusted projects may also use a project-scoped `.codex/config.toml`. The
+resulting block looks like this, if you prefer to write or review it by hand:
+
+```toml
+[mcp_servers.langgraph-context]
+command = "/Users/you/.local/bin/langgraph-context-mcp"
+args = ["serve"]
+```
+
+**Without touching a config file:** in the ChatGPT desktop app, go to Settings → MCP servers → Add
+server, give it a name, choose **STDIO**, enter the same absolute command, and restart.
 
 ### The seven tools
 
@@ -124,12 +307,29 @@ Index a repository first (`langgraph-context-mcp index /abs/path/to/repo`); the 
 | `explain_conditional` | Every destination a conditional edge can route to |
 | `reindex` | Rebuild the index after the graph has changed |
 
+Two of these deliberately distinguish "there is nothing" from "we could not tell", because
+conflating them is how a static analyser ends up stating something false:
+
+- **`explain_conditional`** returns `not_conditional` when a node's body was read and genuinely has
+  no conditional edge — but `routing_not_resolvable` when the node has no *declared* conditional
+  edge and its routing could not be enumerated. That happens when the node's function could not be
+  located, or when it routes with `Command(goto=...)` whose destination is computed at runtime
+  rather than written as a literal. The second result means "this node may well branch, and we
+  cannot say where" — never treat it as "this node does not branch".
+- **`what_calls_tool`** returns `unenumerated_tool_nodes` alongside `callers`, listing nodes that
+  bind tools which could not be read statically, so an empty `callers` list is never mistaken for
+  "nothing uses this tool".
+
+`trace_path` follows the same rule: when it finds no route, it also returns
+`unresolved_routing_nodes`, so "no declared path" is distinguishable from "definitely not
+connected".
+
 ## Storage backends
 
-By default the index is a single SQLite file at `<repo>/.langgraph-context/index.db` — no server,
-no configuration. Set `DATABASE_URL` to a PostgreSQL connection string with the `pgvector`
-extension installed to use that instead; the tables and the HNSW index are created automatically
-on first connection.
+By default the index is a single SQLite file at `<repo>/.langgraph-context/index.db` — no server, no
+configuration. Set `DATABASE_URL` to a PostgreSQL connection string with the `pgvector` extension
+installed to use that instead; the tables and the HNSW index are created automatically on first
+connection.
 
 | Variable | Purpose | Default |
 |---|---|---|
@@ -142,35 +342,37 @@ network calls at all — apart from your own `DATABASE_URL`, if you set one.
 
 ## Status & limits
 
-*As of 2026-08-18. Pre-launch: the engine and the MCP surface are built and tested; packaging and
-the final pre-launch QA pass are not finished.*
+*As of 2026-08-18. Pre-launch: the engine and the MCP surface are built and tested; publication to
+PyPI has not happened yet.*
 
 ### What has actually been verified
 
 Measured against real, unmodified open-source LangGraph repositories, not only synthetic fixtures:
 
 - **Parses real code.** `langchain-ai/open_deep_research` (@ `1b7d2e8`) yields 7 graphs, 23 nodes
-  and 23 edges, 3 of them partially resolved, with no crash. Tool-binding shapes were additionally
-  surveyed across 4 unmodified repositories.
-- **Indexes inside the target.** That repository indexes end to end in ~19s on CPU, including the
-  one-time model load — against a design target of 30s. A generated 250-node graph indexes in ~19s.
+  and 39 edges, 3 partially resolved, with no crash. A 450-file monorepo
+  (`langchain-ai/langgraph` @ `644815f`) yields 125 graphs, 468 nodes and 568 edges in ~56s.
+- **Indexes inside the target.** That first repository indexes end to end in ~20s on CPU, including
+  the one-time model load — against a design target of 30s.
 - **Retrieval holds up adversarially.** On five queries deliberately phrased so a common verb
   lexically matches the *wrong* node's name, the correct node was in the top 3 every time and
   ranked first in 4 of 5.
 - **Both backends agree.** SQLite and PostgreSQL + `pgvector` return the same ranking order on
-  identical data — zero ordering differences, worst score delta ~6e-07 — because both are pinned
-  to cosine on unit-length vectors rather than left on their differing defaults.
+  identical data — zero ordering differences, worst score delta ~6e-07 — because both are pinned to
+  cosine on unit-length vectors rather than left on their differing defaults.
 - **Genuinely offline.** With outbound sockets blocked at the OS level, a full query completes with
   zero connection attempts once the model is cached.
-- **Re-indexing is idempotent.** Five consecutive runs leave exactly one repository row, one graph
-  row and four chunk rows — no duplicates, and rows for deleted nodes are dropped.
+- **Re-indexing is idempotent.** Repeated runs leave exactly one repository row and one graph row
+  per graph — no duplicates, and rows for deleted nodes are dropped.
+- **Survives interruption.** Killing an index mid-run leaves an index that passes SQLite's
+  `integrity_check` with no half-written rows; `status` reports it honestly and re-indexing recovers.
 - **Works with real MCP clients.** All seven tools list and execute under the MCP Inspector, the
   `mcp` SDK's own stdio client, and Claude Desktop.
-- **Test suite:** 265 passing. A further 25 `pgvector` tests skip without `DATABASE_URL` and run in
-  CI against PostgreSQL 16 + `pgvector`.
+- **Test suite:** 307 tests. 282 pass on a default machine with 25 `pgvector` tests skipped; all 307
+  run in CI against PostgreSQL 16 + `pgvector`, where 305 pass and 2 platform-specific tests skip.
 
-Not yet exercised: Claude Code's bundled client (Claude Desktop is verified), and installation from
-PyPI, which does not exist until launch.
+Not yet exercised: Cursor's and Codex's bundled clients (Claude Desktop is verified), and
+installation from PyPI, which does not exist until launch.
 
 ### Where it stops
 
@@ -187,6 +389,12 @@ text, which is what makes the structural answers exact and free to run.
 
 **What static analysis cannot reach.**
 
+- *Routing declared in a node's body* — `return Command(goto="next")` — is parsed, including
+  branching across several `if` arms, the `END` sentinel, and `Send(...)` fan-out. A `goto` whose
+  destination is a **computed value** cannot be, so that node yields no edge for it and is reported
+  as `routing_not_resolvable` rather than as having no routing. Destinations declared only in a
+  `Command[Literal[...]]` return annotation are deliberately not treated as edges, since an
+  annotation states intent rather than a route actually taken.
 - *Dynamically built nodes* — registered in a loop, returned from a factory, or bound as a lambda —
   are indexed and marked `resolution: "partial"`, never dropped. Nodes registered inside a loop
   additionally collapse into a single entry carrying a synthesized placeholder name, so the
@@ -218,8 +426,8 @@ out of the top 3.
 **Index integrity.** A damaged index fails loudly rather than returning wrong results, but the
 message still carries SQLite's own wording rather than plainly saying the index is corrupt — and a
 zero-length index file reports as "not indexed" instead of damaged, because SQLite cannot tell the
-two apart. If a repository you just indexed insists it is not indexed, delete
-`.langgraph-context/` and re-run `index`.
+two apart. If a repository you just indexed insists it is not indexed, delete `.langgraph-context/`
+and re-run `index`.
 
 **Storage and privacy.** Indexed source is stored in plaintext in whichever backend you choose.
 Point `DATABASE_URL` at a shared database and your node bodies and docstrings — including any
