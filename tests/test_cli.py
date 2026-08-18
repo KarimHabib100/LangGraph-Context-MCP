@@ -10,13 +10,19 @@ read stdout/stderr through ``capsys``. Indexing runs on the fake embedder.
 
 from __future__ import annotations
 
+import io
 import json
+import sys
+from pathlib import Path
 
 import pytest
 from support import FakeEmbeddingProvider, configured_backend
 
+from langgraph_context_mcp import cli
 from langgraph_context_mcp.cli import EXIT_ERROR, EXIT_NEGATIVE, EXIT_OK, main
 from langgraph_context_mcp.tools import mcp_tools
+
+FIXTURE = Path(__file__).parent / "fixtures" / "sample_graphs" / "simple_graph.py"
 
 
 @pytest.fixture(autouse=True)
@@ -262,3 +268,106 @@ def test_serve_writes_nothing_to_stdout(monkeypatch, capsys):
     main(["serve"])
 
     assert capsys.readouterr().out == ""
+
+
+# --------------------------------------------------------------------------------------------
+# QA-5-05 — non-ASCII repo paths must not crash the human-readable output path
+# --------------------------------------------------------------------------------------------
+# The two scripts QA bisected the failure with. Latin-1 names never reproduced it, so they are not
+# a regression test; these two are.
+NON_ASCII_DIR_NAMES = ["日本語", "проект"]
+
+
+class _LegacyConsole(io.TextIOBase):
+    """A stream that fails exactly the way a Windows cp1252 console does.
+
+    The real bug is invisible on a UTF-8 terminal, so reproducing it needs a stream whose encoding
+    genuinely cannot represent the path — otherwise the test passes everywhere and guards nothing.
+    """
+
+    encoding = "cp1252"
+
+    def __init__(self) -> None:
+        self.written: list[str] = []
+
+    def write(self, s: str) -> int:
+        s.encode(self.encoding)  # raises UnicodeEncodeError on CJK / Cyrillic
+        self.written.append(s)
+        return len(s)
+
+    @property
+    def text(self) -> str:
+        return "".join(self.written)
+
+
+@pytest.mark.parametrize("dir_name", NON_ASCII_DIR_NAMES)
+def test_index_and_status_survive_a_non_ascii_path_on_a_legacy_console(
+    tmp_path, monkeypatch, dir_name
+):
+    """QA-5-05: indexing succeeded, then printing the result crashed with UnicodeEncodeError.
+
+    Both subcommands are exercised because both interpolate the repo path into their summary.
+    """
+    repo = tmp_path / dir_name
+    repo.mkdir()
+    (repo / "graph.py").write_text(FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+
+    console = _LegacyConsole()
+    monkeypatch.setattr(sys, "stdout", console)
+    index_code = main(["index", str(repo)])
+    status_code = main(["status", str(repo)])
+
+    assert index_code == EXIT_OK, "the index itself always worked; only printing it failed"
+    assert status_code == EXIT_OK
+    # Not lost to '?' — the directory must stay identifiable in the escaped form.
+    assert "\\u" in console.text
+
+
+@pytest.mark.parametrize("dir_name", NON_ASCII_DIR_NAMES)
+def test_non_ascii_path_output_is_exact_when_the_console_can_encode_it(
+    tmp_path, capsys, dir_name
+):
+    """The fallback must be a fallback: a UTF-8 stream still gets the real characters."""
+    repo = tmp_path / dir_name
+    repo.mkdir()
+    (repo / "graph.py").write_text(FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+
+    assert main(["index", str(repo)]) == EXIT_OK
+    assert dir_name in capsys.readouterr().out
+
+
+def test_a_failure_in_the_output_stage_exits_2_not_1(fixture_repo, monkeypatch, capsys):
+    """The second half of QA-5-05, and the reason it was a contract bug and not only a crash.
+
+    An exception escaping `main()` ends the process with Python's default exit code of 1 — the
+    same number DEC-019 reserves for "ran correctly, the answer is negative". A script would read
+    a crash as a clean negative answer. `main()` must therefore *return* 2 rather than raise.
+    """
+    def explode(*args, **kwargs):
+        raise UnicodeEncodeError("cp1252", "x", 0, 1, "simulated console failure")
+
+    monkeypatch.setattr(cli, "_write_line", explode)
+
+    code = main(["index", str(fixture_repo)])
+
+    assert code == EXIT_ERROR, "a failure must land on 2 by contract, never on 1 by accident"
+    assert code != EXIT_NEGATIVE
+
+
+def test_main_returns_rather_than_raising_when_output_fails(fixture_repo, monkeypatch):
+    """Pin the mechanism, not just the number: nothing may escape `main()`.
+
+    If an exception ever escapes again, the process exit code silently becomes 1 regardless of
+    what the contract says — so this asserts the absence of a raise directly.
+    """
+    def explode(*args, **kwargs):
+        raise RuntimeError("unexpected failure inside the command")
+
+    monkeypatch.setattr(cli, "_run_index", explode)
+
+    try:
+        code = main(["index", str(fixture_repo)])
+    except Exception as exc:  # noqa: BLE001 - the failure mode under test
+        pytest.fail(f"main() raised {type(exc).__name__} instead of returning an exit code")
+
+    assert code == EXIT_ERROR

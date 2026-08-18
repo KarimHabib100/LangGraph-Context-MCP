@@ -59,12 +59,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     configure_logging()
 
-    if args.command == "index":
-        return _run_index(args.path, as_json=args.json)
-    if args.command == "status":
-        return _run_status(args.path, as_json=args.json)
-    if args.command == "serve":
-        return _run_serve()
+    # Total guard, so this function always *returns* a code from the DEC-019 band instead of
+    # letting an exception escape. That distinction is not cosmetic: an uncaught exception exits
+    # the process with Python's default of 1, which happens to be the same number as
+    # EXIT_NEGATIVE — so a crash would be reported to a script as "ran fine, the answer is no".
+    # QA-5-05 hit exactly this, crashing in the output step after indexing had already succeeded.
+    # The per-command handlers below still map expected failures themselves; this catches only
+    # what they did not anticipate. KeyboardInterrupt and SystemExit are BaseException and pass
+    # through untouched, so Ctrl+C and argparse's own exit keep their existing behaviour.
+    try:
+        if args.command == "index":
+            return _run_index(args.path, as_json=args.json)
+        if args.command == "status":
+            return _run_status(args.path, as_json=args.json)
+        if args.command == "serve":
+            return _run_serve()
+    except Exception as exc:
+        logger.exception("%s failed", args.command)
+        return _fail(f"{args.command} failed: {type(exc).__name__}: {exc}")
 
     parser.print_help(sys.stderr)  # argparse enforces `required`, so this is unreachable in practice
     return EXIT_ERROR
@@ -219,14 +231,49 @@ def _run_serve() -> int:
 # --------------------------------------------------------------------------------------------
 # Output helpers
 # --------------------------------------------------------------------------------------------
+def _write_line(stream: TextIO, message: str) -> None:
+    """Write one line, surviving a console that cannot encode the message (QA-5-05).
+
+    A repository path may contain characters the console's codepage has no mapping for — a
+    Japanese or Cyrillic directory name on a Windows cp1252 console is the ordinary case, since
+    repositories commonly live under ``C:\\Users\\<name>``. The stream then raises
+    ``UnicodeEncodeError`` *while printing a result that was already computed correctly*, which
+    turned a completed index into a crash.
+
+    The fallback re-encodes through the stream's own encoding with ``backslashreplace``, chosen
+    over ``replace`` deliberately: ``\\u65e5\\u672c\\u8a9e`` still identifies which directory was
+    meant, whereas ``???`` destroys exactly the information the line exists to convey. Output
+    degrades to escapes on a legacy console and stays exact everywhere else.
+    """
+    line = f"{message}\n"
+    try:
+        stream.write(line)
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "ascii"
+        safe = line.encode(encoding, errors="backslashreplace").decode(encoding, errors="replace")
+        stream.write(safe)
+
+
 def _out(message: str, stream: TextIO | None = None) -> None:
     """Write a line of command output to stdout (never used by ``serve``)."""
-    (stream or sys.stdout).write(f"{message}\n")
+    _write_line(stream or sys.stdout, message)
 
 
 def _err(message: str) -> None:
-    """Write a line of command output to stderr."""
-    sys.stderr.write(f"{message}\n")
+    """Write a line of command output to stderr, best-effort.
+
+    Deliberately total. This is the path that reports a failure, so it must not be able to raise
+    a second one: if writing the diagnostic fails, the caller still needs to return its exit code.
+    Otherwise the report of a broken output stream escapes through ``main()`` and the process ends
+    on Python's default exit 1 — the very collision with ``EXIT_NEGATIVE`` that QA-5-05 was about.
+    A message that cannot be delivered is a lost message; the exit code still carries the truth.
+    """
+    try:
+        _write_line(sys.stderr, message)
+    except Exception:  # see the docstring: reporting must never itself fail
+        # `logging` traps its own handler errors rather than propagating them, so this cannot
+        # become the second exception the docstring rules out.
+        logger.debug("Could not write a diagnostic to stderr", exc_info=True)
 
 
 def _fail(message: str) -> int:
